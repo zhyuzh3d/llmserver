@@ -1,0 +1,21 @@
+.DS_Store
+/llmserver
+*.db
+*.db-shm
+*.db-wal
+coverage.out
+dist/
+
+# Local runtime configuration can reference credentials.
+llmserver.yaml
+llmserver.local.yaml
+*.local.yaml
+.env
+.env.*
+!.env.example
+xconfig.yaml
+xconfig.local.yaml
+auth.json
+credentials.json
+.codex/
+.codebuddy/

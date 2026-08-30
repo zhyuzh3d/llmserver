@@ -1,0 +1,66 @@
+server:
+  listen: 127.0.0.1:4815
+  state_path: ../var/llmserver.db
+
+xconfig_import:
+  enabled: false
+
+clients:
+  - id: local-device
+    token_env: LLMSERVER_CLIENT_TOKEN
+    allowed_deployments: [api-model, codex-luna, workbuddy-hy4-preview]
+    include_quota_observations: false
+
+providers:
+  - id: standard-api
+    type: openai_responses
+    display_name: OpenAI-compatible Responses provider
+    base_url: https://api.example.com/v1
+    wire_api: responses
+    api_key_env: UPSTREAM_LLM_API_KEY
+  - id: codex-local
+    type: codex_exec
+    display_name: Local Codex subscription
+    executable: /Applications/ChatGPT.app/Contents/Resources/codex
+    expected_version: "codex-cli 0.151."
+    observe_quota: true
+  - id: workbuddy-local
+    type: workbuddy_exec
+    display_name: Local WorkBuddy subscription
+    executable: /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy
+    expected_version: "2.115."
+
+deployments:
+  - id: api-model
+    provider_id: standard-api
+    upstream_model: replace-with-upstream-model-id
+    hard_budget_supported: true
+    enabled: true
+    price:
+      revision: api-model-public-v1
+      currency: USD
+      input_per_million: "2.000000"
+      output_per_million: "12.000000"
+      source: manual_override
+  - id: codex-luna
+    provider_id: codex-local
+    upstream_model: gpt-5.6-luna
+    hard_budget_supported: false
+    enabled: true
+    price:
+      revision: codex-luna-public-v1
+      currency: USD
+      input_per_million: "0.200000"
+      output_per_million: "1.200000"
+      source: manual_override
+  - id: workbuddy-hy4-preview
+    provider_id: workbuddy-local
+    upstream_model: hy4-preview
+    hard_budget_supported: false
+    enabled: true
+    price:
+      revision: workbuddy-hy4-preview-public-v1
+      currency: USD
+      input_per_million: "2.000000"
+      output_per_million: "12.000000"
+      source: manual_override

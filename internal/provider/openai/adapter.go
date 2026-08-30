@@ -1,0 +1,269 @@
+package openai
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/zhyuzh3d/llmserver/internal/config"
+	"github.com/zhyuzh3d/llmserver/internal/pricing"
+	"github.com/zhyuzh3d/llmserver/internal/provider"
+)
+
+const (
+	maxErrorBody = 64 << 10
+	maxSSEFrame  = 4 << 20
+)
+
+type Adapter struct {
+	providerID string
+	endpoint   string
+	apiKey     config.Secret
+	client     *http.Client
+}
+
+func New(providerID, baseURL string, apiKey config.Secret, client *http.Client) (*Adapter, error) {
+	if providerID == "" {
+		return nil, errors.New("provider id is required")
+	}
+	endpoint, err := responsesEndpoint(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey.IsEmpty() {
+		return nil, errors.New("provider API key is empty")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
+	return &Adapter{providerID: providerID, endpoint: endpoint, apiKey: apiKey, client: client}, nil
+}
+
+func (a *Adapter) ID() string { return a.providerID }
+
+func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan provider.Event, error) {
+	body, streaming, err := buildRequestBody(request)
+	if err != nil {
+		return nil, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create provider request: %w", err)
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+a.apiKey.Reveal())
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("User-Agent", "llmserver/0.1")
+	if streaming {
+		httpRequest.Header.Set("Accept", "text/event-stream")
+	}
+
+	response, err := a.client.Do(httpRequest)
+	if err != nil {
+		return nil, fmt.Errorf("send provider request: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBody))
+		return nil, fmt.Errorf("provider returned HTTP %d", response.StatusCode)
+	}
+
+	events := make(chan provider.Event)
+	go func() {
+		defer close(events)
+		defer response.Body.Close()
+		if streaming {
+			consumeStream(ctx, response.Body, events)
+			return
+		}
+		consumeResponse(ctx, response.Body, events)
+	}()
+	return events, nil
+}
+
+func responsesEndpoint(baseURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid provider base URL")
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/v1/responses"):
+	case strings.HasSuffix(path, "/v1"):
+		path += "/responses"
+	default:
+		path += "/v1/responses"
+	}
+	parsed.Path = path
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func buildRequestBody(request provider.Request) ([]byte, bool, error) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(request.RawRequest, &body); err != nil {
+		return nil, false, fmt.Errorf("decode provider request: %w", err)
+	}
+	model, err := json.Marshal(request.UpstreamModel)
+	if err != nil {
+		return nil, false, err
+	}
+	body["model"] = model
+	delete(body, "llmserver")
+	var streaming bool
+	if raw, ok := body["stream"]; ok {
+		if err := json.Unmarshal(raw, &streaming); err != nil {
+			return nil, false, errors.New("stream must be a boolean")
+		}
+	}
+	encoded, err := json.Marshal(body)
+	return encoded, streaming, err
+}
+
+func consumeResponse(ctx context.Context, body io.Reader, events chan<- provider.Event) {
+	var response map[string]any
+	decoder := json.NewDecoder(io.LimitReader(body, 64<<20))
+	decoder.UseNumber()
+	if err := decoder.Decode(&response); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("decode provider response: %w", err)})
+		return
+	}
+	final := finalFromResponse(response)
+	send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: &final})
+}
+
+func consumeStream(ctx context.Context, body io.Reader, events chan<- provider.Event) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64<<10), maxSSEFrame)
+	var dataLines []string
+	completed := false
+	flush := func() bool {
+		if len(dataLines) == 0 {
+			return true
+		}
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		if data == "[DONE]" {
+			return true
+		}
+		var event map[string]any
+		decoder := json.NewDecoder(strings.NewReader(data))
+		decoder.UseNumber()
+		if err := decoder.Decode(&event); err != nil {
+			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("decode provider stream event: %w", err)})
+			return false
+		}
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "response.output_text.delta":
+			delta, _ := event["delta"].(string)
+			return send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: delta})
+		case "response.completed":
+			response, ok := event["response"].(map[string]any)
+			if !ok {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("provider completion has no response")})
+				return false
+			}
+			final := finalFromResponse(response)
+			completed = true
+			return send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: &final})
+		case "error", "response.failed", "response.incomplete":
+			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("provider event %s", eventType)})
+			return false
+		default:
+			return true
+		}
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if !flush() || completed {
+				return
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if len(dataLines) > 0 && !completed {
+		if !flush() || completed {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("read provider stream: %w", err)})
+		return
+	}
+	if !completed {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("provider stream ended before completion")})
+	}
+}
+
+func finalFromResponse(response map[string]any) provider.Final {
+	model, _ := response["model"].(string)
+	return provider.Final{
+		Response:       response,
+		OutputText:     extractOutputText(response),
+		EffectiveModel: model,
+		Usage:          extractUsage(response),
+	}
+}
+
+func extractUsage(response map[string]any) pricing.ReportedUsage {
+	usage, _ := response["usage"].(map[string]any)
+	input, inputOK := integer(usage["input_tokens"])
+	output, outputOK := integer(usage["output_tokens"])
+	return pricing.ReportedUsage{
+		InputTokens:  pricing.OptionalCount{Value: input, Present: inputOK},
+		OutputTokens: pricing.OptionalCount{Value: output, Present: outputOK},
+	}
+}
+
+func integer(value any) (int64, bool) {
+	switch item := value.(type) {
+	case json.Number:
+		parsed, err := item.Int64()
+		return parsed, err == nil && parsed >= 0
+	case float64:
+		parsed := int64(item)
+		return parsed, item == float64(parsed) && parsed >= 0
+	default:
+		return 0, false
+	}
+}
+
+func extractOutputText(response map[string]any) string {
+	output, _ := response["output"].([]any)
+	var text strings.Builder
+	for _, itemValue := range output {
+		item, _ := itemValue.(map[string]any)
+		content, _ := item["content"].([]any)
+		for _, contentValue := range content {
+			part, _ := contentValue.(map[string]any)
+			if part["type"] == "output_text" {
+				value, _ := part["text"].(string)
+				text.WriteString(value)
+			}
+		}
+	}
+	return text.String()
+}
+
+func send(ctx context.Context, target chan<- provider.Event, event provider.Event) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case target <- event:
+		return true
+	}
+}

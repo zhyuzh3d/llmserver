@@ -1,0 +1,100 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+
+	"github.com/zhyuzh3d/llmserver/internal/gateway"
+)
+
+func TestCompletedRunSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := gateway.RunReservation{RunID: "req_one", ClientID: "device", DeploymentID: "terra", IdempotencyKey: "operation", Fingerprint: "fingerprint"}
+	if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
+		t.Fatalf("reserve created=%t err=%v", created, err)
+	}
+	if err := repository.MarkRunning(context.Background(), reservation.RunID); err != nil {
+		t.Fatal(err)
+	}
+	completion := gateway.RunCompletion{
+		RunID: reservation.RunID, ResponseJSON: []byte(`{"id":"resp_one"}`), BillingJSON: []byte(`{"request_id":"req_one"}`),
+		InputTokens: 2, OutputTokens: 1, InputSource: "estimated_v1", OutputSource: "provider_reported", Estimator: "text_estimator_v1",
+		InputChars: 5, PriceVersion: "price_public", Currency: "USD", InputUnitPrice: "2.000000000", OutputUnitPrice: "12.000000000",
+		InputCharge: "0.000004000", OutputCharge: "0.000012000", TotalCharge: "0.000016000",
+	}
+	if err := repository.Complete(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	record, created, err := reopened.Reserve(context.Background(), gateway.RunReservation{
+		RunID: "req_two", ClientID: "device", DeploymentID: "terra", IdempotencyKey: "operation", Fingerprint: "fingerprint",
+	})
+	if err != nil || created {
+		t.Fatalf("retry created=%t err=%v", created, err)
+	}
+	if record.RunID != "req_one" || record.Status != "completed" || record.SettlementState != "confirmed" {
+		t.Fatalf("stored record = %#v", record)
+	}
+}
+
+func TestSameIdempotencyKeyIsScopedByClient(t *testing.T) {
+	repository, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	for _, reservation := range []gateway.RunReservation{
+		{RunID: "req_one", ClientID: "device-one", DeploymentID: "terra", IdempotencyKey: "same", Fingerprint: "one"},
+		{RunID: "req_two", ClientID: "device-two", DeploymentID: "terra", IdempotencyKey: "same", Fingerprint: "two"},
+	} {
+		if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
+			t.Fatalf("reserve %#v created=%t err=%v", reservation, created, err)
+		}
+	}
+}
+
+func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
+	repository, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	reservation := gateway.RunReservation{RunID: "req_quota", ClientID: "device", DeploymentID: "codex", Fingerprint: "fingerprint"}
+	if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
+		t.Fatalf("reserve created=%t err=%v", created, err)
+	}
+	if err := repository.MarkRunning(context.Background(), reservation.RunID); err != nil {
+		t.Fatal(err)
+	}
+	quota := json.RawMessage(`[{"limit_id":"codex:primary","unit":"percent_used","before":7,"after":8,"delta":1,"status":"observed","attribution":"shared_account_window"}]`)
+	completion := gateway.RunCompletion{
+		RunID: reservation.RunID, ResponseJSON: []byte(`{"id":"resp_quota"}`), BillingJSON: []byte(`{"request_id":"req_quota"}`),
+		InputTokens: 1, OutputTokens: 1, InputSource: "provider_reported", OutputSource: "provider_reported",
+		PriceVersion: "price_public", Currency: "USD", InputUnitPrice: "1.000000000", OutputUnitPrice: "1.000000000",
+		InputCharge: "0.000001000", OutputCharge: "0.000001000", TotalCharge: "0.000002000", QuotaJSON: quota,
+	}
+	if err := repository.Complete(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	var stored []byte
+	if err := repository.db.QueryRow(`SELECT payload_json FROM run_quota_observations WHERE run_id = ?`, reservation.RunID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != string(quota) {
+		t.Fatalf("quota = %s", stored)
+	}
+}
