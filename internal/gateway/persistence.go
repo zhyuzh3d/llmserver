@@ -30,25 +30,27 @@ type StoredRun struct {
 }
 
 type RunCompletion struct {
-	RunID           string
-	ResponseJSON    []byte
-	BillingJSON     []byte
-	InputTokens     int64
-	OutputTokens    int64
-	InputSource     string
-	OutputSource    string
-	Estimator       string
-	InputChars      int64
-	OutputChars     int64
-	PriceVersion    string
-	Currency        string
-	InputUnitPrice  string
-	OutputUnitPrice string
-	InputCharge     string
-	OutputCharge    string
-	TotalCharge     string
-	BudgetJSON      []byte
-	QuotaJSON       []byte
+	RunID            string
+	ResponseJSON     []byte
+	BillingJSON      []byte
+	InputTokens      int64
+	OutputTokens     int64
+	InputSource      string
+	OutputSource     string
+	Estimator        string
+	InputChars       int64
+	OutputChars      int64
+	PriceVersion     string
+	Currency         string
+	InputUnitPrice   string
+	OutputUnitPrice  string
+	InputCharge      string
+	OutputCharge     string
+	TotalCharge      string
+	BudgetJSON       []byte
+	QuotaJSON        []byte
+	ProviderID       string
+	UpstreamCostJSON []byte
 }
 
 type Option func(*Service)

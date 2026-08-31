@@ -1,11 +1,11 @@
-# llmServer 后端产品与技术总纲 v0.2
+# llmServer 产品与技术总纲 v0.3
 
 > 文档性质：长期产品边界、公共契约与分阶段开发基线
 > 目标平台：macOS 本机常驻服务
 > 对外形态：面向本机及受信任局域网设备的 OpenAI 兼容 HTTP/SSE API
 > 上游类型：标准模型 API、OpenAI Codex、腾讯 WorkBuddy / CodeBuddy Code
-> 调研与本机验证日期：2026-08-30
-> 当前状态：设计基线；Stage 1 核心链路和 Stage 2/3 首个本机 Adapter 已实现，完整 LAN 安全与运维退出门尚未满足，详见 [实现状态](./implementation-status.md)
+> 调研与本机验证日期：2026-08-31
+> 当前状态：Stage 1 结算主链、Stage 2/3 首个本机 Adapter、本机管理台和用户级常驻运行已实现；未实现项与真实验证见 [实现状态](./implementation-status.md)
 
 ## 1. 产品结论
 
@@ -29,7 +29,7 @@ trusted local / LAN clients
 
 本仓库不负责 Hominal 或任何具体业务系统的接入、配置迁移和真实运行验收。Hominal 未来只是普通 OpenAI 兼容客户端之一，其适配应在 Hominal 项目中完成。llmServer 的验收使用确定性模拟上游、冻结协议样本和 API 契约测试，不要求 Hominal 发起真实调用。
 
-Web 控制台从当前后端计划中移除。首版配置由版本化配置文件和 CLI 完成；等后端契约、配置模型与结算模型稳定后，再单独设计 Web 控制台，避免前端反过来固化尚未验证的概念。
+本机 Web 管理台是稳定管理 API 的薄客户端：负责 Provider/Key、模型发现、Deployment、价格、设备策略和消耗汇总。它不直接调用 Adapter、不持有另一套配置、不参与请求结算，也不是服务恢复所必需的组件。管理端强制监听回环地址。
 
 ## 2. 产品边界
 
@@ -54,7 +54,7 @@ Web 控制台从当前后端计划中移除。首版配置由版本化配置文�
 - 默认允许远端请求通过 Codex/WorkBuddy 执行 shell、改文件、操作 GUI 或浏览器；
 - 向调用方暴露供应商真实成本、价格来源或 Codex/WorkBuddy 的内部定价方式；
 - 完整复刻 Codex、WorkBuddy 的 agent、插件、文件和终端能力；
-- 当前三个 Stage 内的 Web 管理控制台。
+- 公开互联网管理端、多租户管理和远程下发本机登录凭据。
 
 ## 3. 三阶段路线
 
@@ -62,7 +62,7 @@ Web 控制台从当前后端计划中移除。首版配置由版本化配置文�
 
 | Stage | 交付内容 | 退出条件 |
 | --- | --- | --- |
-| Stage 1 | 标准 API 核心、统一事件、Model Deployment、客户端鉴权、价格预算与结算、模拟上游 | 不依赖真实供应商即可完成兼容 API、SSE、预算、结算、失败恢复的确定性测试 |
+| Stage 1 | 标准 API 核心、统一事件、Model Deployment、客户端鉴权、价格预算与结算、本机管理面、模拟上游 | 不依赖真实供应商即可完成兼容 API、SSE、预算、结算、配置热更新和失败恢复的确定性测试 |
 | Stage 2 | Codex App Server stdio Adapter、模型/usage/多窗口额度映射、工具隔离 | 冻结的 Codex 模拟进程覆盖初始化、生成、取消、reroute、usage、配额与崩溃；无本地副作用 |
 | Stage 3 | WorkBuddy/CodeBuddy Adapter、模型/usage/credits/额度映射、工具隔离 | 冻结的 WorkBuddy 模拟进程覆盖生成、取消、usage、额度、模型漂移和权限请求；无本地副作用 |
 
@@ -72,7 +72,7 @@ Web 控制台从当前后端计划中移除。首版配置由版本化配置文�
 - [Stage 2：Codex Adapter](./stage-2-codex.md)
 - [Stage 3：WorkBuddy Adapter](./stage-3-workbuddy.md)
 
-Web 控制台不是 Stage 1 的一部分。未来若建设，应只调用稳定的管理 API，不直接接触 Adapter，也不成为服务启动、配置恢复或结算的必要条件。
+管理台只调用稳定的本机管理 API。公开配置与秘密配置仍分别以 `configs/config.yaml` 和 `../xconfigs/llmserver/xconfig.yaml` 为唯一事实源；管理台只是受约束的读写入口。
 
 ## 4. 核心概念
 
@@ -407,7 +407,7 @@ Provider 自己的本地工具和调用方定义的函数是两个命名空间�
 
 ## 13. 技术实现建议
 
-核心服务建议使用 Go：适合 HTTP/SSE、子进程管理、定点金额、并发调度和单二进制部署。服务作为当前用户 LaunchAgent 运行，而不是 root LaunchDaemon，因为 Keychain 及本机软件登录态属于用户会话。
+核心服务使用 Go：适合 HTTP/SSE、子进程管理、定点金额、并发调度和单二进制部署。服务通过当前用户域的 `launchctl submit` 常驻，而不是 root LaunchDaemon，因为本机软件登录态属于用户会话。该方式不增加第三个配置文件，系统重启后由管理员重新注册。
 
 首版模块边界：
 
@@ -425,9 +425,12 @@ internal/providers/workbuddy
 internal/auth          客户端 Token 与授权
 internal/store         SQLite 与 revision
 internal/config        声明式配置与校验
+internal/runtimecfg     配置验证、保存与运行快照切换
+internal/discovery      三类 Provider 的模型发现
+internal/admin          仅回环管理 API 与静态 Web 页面
 ```
 
-不要在 Stage 1 提前建立通用插件运行时、规则 DSL、复杂路由语言或 Web 前端。新增 Adapter 所需的最小稳定面就是 `ProviderAdapter + GatewayEvent + ModelDeployment + Settlement`。
+不要建立通用插件运行时、规则 DSL 或复杂路由语言。管理页面保持薄层；新增 Adapter 所需的最小稳定面仍是 `ProviderAdapter + GatewayEvent + ModelDeployment + Settlement + ModelDiscovery`。
 
 ## 14. 主要风险与控制
 

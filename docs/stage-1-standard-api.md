@@ -273,7 +273,7 @@ Adapter 职责：
 
 一个物理设备应使用一个独立客户端 Token。未来控制台按 Token/设备修改返回策略；当前由配置文件和 CLI 使用同一策略接口管理。
 
-默认回环监听。LAN 模式启动时若未配置 TLS 和客户端鉴权，服务必须拒绝启动，而不是仅打印警告。管理 CLI 通过本机 Unix socket 或直接访问数据库服务层，不开放 LAN 管理端点。
+API 可在可信隔离 LAN 监听，但必须启用客户端 Token；当前版本没有内建 TLS，跨不可信网络应由前置 HTTPS/mTLS、VPN 或零信任入口保护。管理 API 始终强制回环监听，不开放 LAN 管理端点。
 
 ## 9. 实现切片
 
@@ -299,7 +299,7 @@ Adapter 职责：
 
 ### Slice 6：Chat Completions 与发布骨架
 
-实现 Chat Completions 投影、CLI、LaunchAgent 模板、滚动日志与脱敏。退出条件是安装、启动、重启、数据库恢复和卸载流程可重复。
+实现 Chat Completions 投影、管理 CLI、日志轮转与脱敏。常驻骨架当前已使用 `launchctl submit` 脚本实现，不创建第三个配置文件；Chat Completions 仍未实现。最终退出条件是安装、启动、重启、数据库恢复和卸载流程可重复。
 
 ## 10. 自动测试矩阵
 

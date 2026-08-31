@@ -216,7 +216,81 @@ func finalFromResponse(response map[string]any) provider.Final {
 		OutputText:     extractOutputText(response),
 		EffectiveModel: model,
 		Usage:          extractUsage(response),
+		Costs:          extractCosts(response),
 	}
+}
+
+func extractCosts(response map[string]any) []provider.CostObservation {
+	usage, _ := response["usage"].(map[string]any)
+	for _, container := range []map[string]any{usage, response} {
+		if len(container) == 0 {
+			continue
+		}
+		for _, key := range []string{"cost", "costs"} {
+			if object, ok := container[key].(map[string]any); ok {
+				if observation, valid := costObject(object, stringValue(container["currency"])); valid {
+					return []provider.CostObservation{observation}
+				}
+			}
+		}
+		if total, ok := decimalValue(firstValue(container, "total_cost", "cost")); ok {
+			unit := stringValue(firstValue(container, "currency", "unit"))
+			return []provider.CostObservation{{Unit: unit, Total: total}}
+		}
+	}
+	return nil
+}
+
+func costObject(object map[string]any, fallbackUnit string) (provider.CostObservation, bool) {
+	unit := stringValue(firstValue(object, "currency", "unit"))
+	if unit == "" {
+		unit = fallbackUnit
+	}
+	input, _ := decimalValue(firstValue(object, "input", "input_cost"))
+	output, _ := decimalValue(firstValue(object, "output", "output_cost"))
+	total, totalOK := decimalValue(firstValue(object, "total", "total_cost"))
+	if !totalOK && input != "" && output != "" {
+		left, leftErr := pricing.ParseDecimal(input)
+		right, rightErr := pricing.ParseDecimal(output)
+		if leftErr == nil && rightErr == nil {
+			if sum, err := left.Add(right); err == nil {
+				total = sum.String()
+				totalOK = true
+			}
+		}
+	}
+	return provider.CostObservation{Unit: unit, Input: input, Output: output, Total: total}, totalOK
+}
+
+func firstValue(values map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return strings.ToUpper(strings.TrimSpace(text))
+}
+
+func decimalValue(value any) (string, bool) {
+	var raw string
+	switch item := value.(type) {
+	case json.Number:
+		raw = item.String()
+	case string:
+		raw = item
+	default:
+		return "", false
+	}
+	parsed, err := pricing.ParseDecimal(raw)
+	if err != nil || parsed.Nanos() < 0 {
+		return "", false
+	}
+	return parsed.String(), true
 }
 
 func extractUsage(response map[string]any) pricing.ReportedUsage {

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>llmserver 管理台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">L</span>
+        <div><strong>llmserver</strong><small>本机模型网关</small></div>
+      </div>
+      <nav aria-label="管理导航">
+        <button class="nav-item active" data-view="overview"><span>概览</span><kbd>1</kbd></button>
+        <button class="nav-item" data-view="providers"><span>供应商</span><kbd>2</kbd></button>
+        <button class="nav-item" data-view="models"><span>模型与定价</span><kbd>3</kbd></button>
+        <button class="nav-item" data-view="usage"><span>消耗统计</span><kbd>4</kbd></button>
+        <button class="nav-item" data-view="access"><span>访问设备</span><kbd>5</kbd></button>
+      </nav>
+      <div class="sidebar-note"><i></i><span>仅允许本机访问<br><b id="admin-address">127.0.0.1</b></span></div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">CONTROL PLANE</p><h1 id="page-title">运行概览</h1></div>
+        <div class="top-actions"><span class="status-pill"><i></i>运行中</span><button class="button primary" id="save-all">保存并生效</button></div>
+      </header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="content" class="content" aria-live="polite">
+        <div class="loading"><span></span><p>正在读取本机配置…</p></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="model-dialog">
+    <form method="dialog" class="dialog-card">
+      <header><div><p class="eyebrow">MODEL DISCOVERY</p><h2>选择可用模型</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+      <div id="model-dialog-body" class="dialog-body"></div>
+      <footer><button class="button" value="cancel">取消</button><button type="button" class="button primary" id="apply-models">加入模型配置</button></footer>
+    </form>
+  </dialog>
+  <script src="app.js" defer></script>
+</body>
+</html>

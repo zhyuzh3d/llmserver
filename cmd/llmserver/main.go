@@ -8,97 +8,51 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/zhyuzh3d/llmserver/internal/admin"
 	"github.com/zhyuzh3d/llmserver/internal/api"
-	"github.com/zhyuzh3d/llmserver/internal/auth"
 	"github.com/zhyuzh3d/llmserver/internal/config"
-	"github.com/zhyuzh3d/llmserver/internal/gateway"
-	"github.com/zhyuzh3d/llmserver/internal/provider"
-	codexadapter "github.com/zhyuzh3d/llmserver/internal/provider/codex"
-	"github.com/zhyuzh3d/llmserver/internal/provider/mock"
-	openaiadapter "github.com/zhyuzh3d/llmserver/internal/provider/openai"
-	workbuddyadapter "github.com/zhyuzh3d/llmserver/internal/provider/workbuddy"
+	"github.com/zhyuzh3d/llmserver/internal/runtimecfg"
 	"github.com/zhyuzh3d/llmserver/internal/store"
 )
 
 func main() {
-	configPath := flag.String("config", "llmserver.yaml", "path to llmserver YAML configuration")
-	mockResponse := flag.String("mock-response", "", "use an offline mock provider with this response text")
+	publicPath := flag.String("config", "configs/config.yaml", "path to the non-secret configuration")
+	secretPath := flag.String("xconfig", "../xconfigs/llmserver/xconfig.yaml", "path to the secret xconfig")
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
+	created, err := config.BootstrapSecretFile(*publicPath, *secretPath)
+	if err != nil {
+		fatal("bootstrap secret xconfig", err)
+	}
+	if created {
+		slog.Info("secret xconfig initialized", "path", *secretPath)
+	}
+	cfg, _, err := config.LoadFiles(*publicPath, *secretPath)
 	if err != nil {
 		fatal("load configuration", err)
 	}
-	authenticator, err := auth.FromConfig(cfg.Clients)
-	if err != nil {
-		fatal("configure client authentication", err)
-	}
-	adapters := make([]provider.Adapter, 0, len(cfg.Providers))
-	for _, providerConfig := range cfg.Providers {
-		if *mockResponse != "" {
-			adapters = append(adapters, &mock.Adapter{ProviderID: providerConfig.ID, ResponseText: *mockResponse})
-			continue
-		}
-		switch providerConfig.Type {
-		case "openai_responses":
-			adapter, adapterErr := openaiadapter.New(providerConfig.ID, providerConfig.BaseURL, providerConfig.APIKey, nil)
-			if adapterErr != nil {
-				fatal("configure provider "+providerConfig.ID, adapterErr)
-			}
-			adapters = append(adapters, adapter)
-		case "codex_exec":
-			adapter, adapterErr := codexadapter.New(codexadapter.Config{
-				ProviderID:      providerConfig.ID,
-				Executable:      providerConfig.Executable,
-				ExpectedVersion: providerConfig.ExpectedVersion,
-				ExtraArgs:       providerConfig.ExtraArgs,
-				ObserveQuota:    providerConfig.ObserveQuota,
-			})
-			if adapterErr != nil {
-				fatal("configure provider "+providerConfig.ID, adapterErr)
-			}
-			adapters = append(adapters, adapter)
-		case "workbuddy_exec":
-			adapter, adapterErr := workbuddyadapter.New(workbuddyadapter.Config{
-				ProviderID:      providerConfig.ID,
-				Executable:      providerConfig.Executable,
-				ExpectedVersion: providerConfig.ExpectedVersion,
-				ExtraArgs:       providerConfig.ExtraArgs,
-			})
-			if adapterErr != nil {
-				fatal("configure provider "+providerConfig.ID, adapterErr)
-			}
-			adapters = append(adapters, adapter)
-		default:
-			fatal("configure provider "+providerConfig.ID, &unsupportedProviderError{providerType: providerConfig.Type})
-		}
-	}
-	runStore, err := store.Open(cfg.Server.StatePath)
+	runStore, err := store.Open(config.ResolveStatePath(*publicPath, cfg.Server.StatePath))
 	if err != nil {
 		fatal("open state database", err)
 	}
 	defer runStore.Close()
-	gatewayService, err := gateway.NewService(cfg.Deployments, adapters, gateway.WithRunRepository(runStore))
+	manager, err := runtimecfg.New(*publicPath, *secretPath, runStore, "")
 	if err != nil {
-		fatal("configure gateway", err)
+		fatal("configure runtime", err)
 	}
-	server := api.NewServer(authenticator, gatewayService)
+	apiServer := api.NewDynamicServer(manager.Current)
+	adminServer := admin.New(manager, runStore)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	mode := "standard-api"
-	if *mockResponse != "" {
-		mode = "offline-mock"
-	}
-	slog.Info("llmserver starting", "listen", cfg.Server.Listen, "mode", mode)
-	if err := api.RunHTTPServer(ctx, cfg.Server.Listen, server.Handler()); err != nil {
+	errCh := make(chan error, 2)
+	go func() { errCh <- api.RunHTTPServer(ctx, cfg.Server.Listen, apiServer.Handler()) }()
+	go func() { errCh <- api.RunHTTPServer(ctx, cfg.Server.AdminListen, adminServer.Handler()) }()
+	slog.Info("llmserver starting", "api", cfg.Server.Listen, "admin", "http://"+cfg.Server.AdminListen+"/admin/")
+	if err := <-errCh; err != nil {
+		cancel()
 		fatal("serve", err)
 	}
-}
-
-type unsupportedProviderError struct{ providerType string }
-
-func (e *unsupportedProviderError) Error() string {
-	return "unsupported provider type " + e.providerType
 }
 
 func fatal(message string, err error) {

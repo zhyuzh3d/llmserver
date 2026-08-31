@@ -19,13 +19,16 @@ import (
 const maxRequestBytes = 10 << 20
 
 type Server struct {
-	authenticator *auth.Authenticator
-	gateway       *gateway.Service
-	mux           *http.ServeMux
+	runtime func() (*auth.Authenticator, *gateway.Service)
+	mux     *http.ServeMux
 }
 
 func NewServer(authenticator *auth.Authenticator, gatewayService *gateway.Service) *Server {
-	server := &Server{authenticator: authenticator, gateway: gatewayService, mux: http.NewServeMux()}
+	return NewDynamicServer(func() (*auth.Authenticator, *gateway.Service) { return authenticator, gatewayService })
+}
+
+func NewDynamicServer(runtime func() (*auth.Authenticator, *gateway.Service)) *Server {
+	server := &Server{runtime: runtime, mux: http.NewServeMux()}
 	server.mux.HandleFunc("GET /healthz", server.handleHealth)
 	server.mux.HandleFunc("GET /readyz", server.handleReady)
 	server.mux.HandleFunc("GET /v1/models", server.handleModels)
@@ -61,7 +64,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	if !s.gateway.Ready() {
+	_, gatewayService := s.runtime()
+	if gatewayService == nil || !gatewayService.Ready() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 		return
 	}
@@ -73,7 +77,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	models := s.gateway.Models(client)
+	_, gatewayService := s.runtime()
+	models := gatewayService.Models(client)
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
 		data = append(data, map[string]any{
@@ -159,7 +164,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, requestID, err := s.gateway.Start(r.Context(), client, gatewayRequest)
+	_, gatewayService := s.runtime()
+	events, requestID, err := gatewayService.Start(r.Context(), client, gatewayRequest)
 	if err != nil {
 		gatewayError := gateway.AsError(err)
 		if gatewayError.RequestID != "" {
@@ -273,7 +279,12 @@ func (s *Server) writeResponseStream(ctx context.Context, w http.ResponseWriter,
 }
 
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*auth.Client, bool) {
-	client, err := s.authenticator.AuthenticateAuthorization(r.Header.Get("Authorization"))
+	authenticator, _ := s.runtime()
+	if authenticator == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "server_error", "not_ready", "llmserver runtime is not ready", "")
+		return nil, false
+	}
+	client, err := authenticator.AuthenticateAuthorization(r.Header.Get("Authorization"))
 	if err != nil {
 		writeAPIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid llmserver API key", "")
 		return nil, false

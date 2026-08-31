@@ -38,7 +38,15 @@ type Final struct {
 	OutputText     string
 	EffectiveModel string
 	Usage          pricing.ReportedUsage
+	Costs          []CostObservation
 	Quota          []QuotaObservation
+}
+
+type CostObservation struct {
+	Unit   string
+	Input  string
+	Output string
+	Total  string
 }
 
 type QuotaObservation struct {

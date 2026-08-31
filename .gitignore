@@ -5,8 +5,9 @@
 *.db-wal
 coverage.out
 dist/
+/var/
 
-# Local runtime configuration can reference credentials.
+# Defense in depth for obsolete or accidentally copied local secret files.
 llmserver.yaml
 llmserver.local.yaml
 *.local.yaml

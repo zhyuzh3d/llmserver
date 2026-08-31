@@ -177,7 +177,11 @@ func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, requested
 				InputTokens:  pricing.OptionalCount{Value: event.Usage.InputTokens, Present: true},
 				OutputTokens: pricing.OptionalCount{Value: event.Usage.OutputTokens, Present: true},
 			}
-			final := &provider.Final{OutputText: finalText, EffectiveModel: effectiveModel, Usage: usage}
+			var costs []provider.CostObservation
+			if cost, err := pricing.ParseDecimal(event.TotalCostUSD.String()); err == nil && cost.Nanos() >= 0 {
+				costs = []provider.CostObservation{{Unit: "USD", Total: cost.String()}}
+			}
+			final := &provider.Final{OutputText: finalText, EffectiveModel: effectiveModel, Usage: usage, Costs: costs}
 			send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: final})
 			completed = true
 		case "system", "file-history-snapshot":
@@ -214,11 +218,12 @@ func safeContentType(contentType string) bool {
 }
 
 type cliEvent struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	IsError bool   `json:"is_error"`
-	Result  string `json:"result"`
-	Message struct {
+	Type         string      `json:"type"`
+	Subtype      string      `json:"subtype"`
+	IsError      bool        `json:"is_error"`
+	Result       string      `json:"result"`
+	TotalCostUSD json.Number `json:"total_cost_usd"`
+	Message      struct {
 		Model   string `json:"model"`
 		Content []struct {
 			Type string `json:"type"`

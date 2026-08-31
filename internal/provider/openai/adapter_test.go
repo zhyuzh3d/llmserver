@@ -32,7 +32,7 @@ func TestNonStreamingRequestIsSanitizedAndUsageIsRead(t *testing.T) {
 			t.Error("private llmserver extension leaked upstream")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"id":"resp_up","object":"response","status":"completed","model":"upstream-model","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+		_, _ = fmt.Fprint(w, `{"id":"resp_up","object":"response","status":"completed","model":"upstream-model","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10,"cost":{"currency":"CNY","input":"0.01","output":"0.02","total":"0.03"}}}`)
 	}))
 	defer upstream.Close()
 
@@ -53,6 +53,9 @@ func TestNonStreamingRequestIsSanitizedAndUsageIsRead(t *testing.T) {
 	}
 	if final.OutputText != "ok" {
 		t.Fatalf("output text = %q", final.OutputText)
+	}
+	if len(final.Costs) != 1 || final.Costs[0].Unit != "CNY" || final.Costs[0].Total != "0.030000000" {
+		t.Fatalf("costs = %#v", final.Costs)
 	}
 }
 

@@ -30,6 +30,8 @@ type Deployment struct {
 	ProviderID          string
 	UpstreamModel       string
 	Price               pricing.PriceRevision
+	ActualPrice         *pricing.PriceRevision
+	ActualPoints        *pricing.PriceRevision
 	Enabled             bool
 	HardBudgetSupported bool
 }
@@ -141,7 +143,7 @@ func NewService(deployments []config.DeploymentConfig, adapters []provider.Adapt
 		if _, exists := service.providers[item.ProviderID]; !exists {
 			return nil, fmt.Errorf("deployment %q has no provider adapter %q", item.ID, item.ProviderID)
 		}
-		service.deployments[item.ID] = Deployment{
+		deployment := Deployment{
 			ID:            item.ID,
 			ProviderID:    item.ProviderID,
 			UpstreamModel: item.UpstreamModel,
@@ -154,6 +156,29 @@ func NewService(deployments []config.DeploymentConfig, adapters []provider.Adapt
 			Enabled:             item.Enabled,
 			HardBudgetSupported: item.HardBudgetSupported,
 		}
+		if item.ActualPrice != nil {
+			actualInput, parseErr := pricing.ParseDecimal(item.ActualPrice.InputPerMillion)
+			if parseErr != nil {
+				return nil, fmt.Errorf("deployment %q actual input price: %w", item.ID, parseErr)
+			}
+			actualOutput, parseErr := pricing.ParseDecimal(item.ActualPrice.OutputPerMillion)
+			if parseErr != nil {
+				return nil, fmt.Errorf("deployment %q actual output price: %w", item.ID, parseErr)
+			}
+			deployment.ActualPrice = &pricing.PriceRevision{ID: item.ActualPrice.Revision, Currency: item.ActualPrice.Currency, InputPerMillion: actualInput, OutputPerMillion: actualOutput}
+		}
+		if item.ActualPoints != nil {
+			pointsInput, parseErr := pricing.ParseDecimal(item.ActualPoints.InputPerMillion)
+			if parseErr != nil {
+				return nil, fmt.Errorf("deployment %q actual input points: %w", item.ID, parseErr)
+			}
+			pointsOutput, parseErr := pricing.ParseDecimal(item.ActualPoints.OutputPerMillion)
+			if parseErr != nil {
+				return nil, fmt.Errorf("deployment %q actual output points: %w", item.ID, parseErr)
+			}
+			deployment.ActualPoints = &pricing.PriceRevision{ID: item.ID + "-points", Currency: "POINTS", InputPerMillion: pointsInput, OutputPerMillion: pointsOutput}
+		}
+		service.deployments[item.ID] = deployment
 	}
 	return service, nil
 }
@@ -321,6 +346,7 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 					return
 				}
 				billing := newBilling(runID, deployment.Price, settlement, budget)
+				actualRecords := calculateActualRecords(deployment, usage, event.Final.Costs)
 				if includeQuota && len(event.Final.Quota) > 0 {
 					billing.QuotaObservations = append([]provider.QuotaObservation(nil), event.Final.Quota...)
 				}
@@ -330,7 +356,8 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 					billingJSON, billingErr := json.Marshal(billing)
 					budgetJSON, budgetErr := json.Marshal(billing.Budget)
 					quotaJSON, quotaErr := json.Marshal(event.Final.Quota)
-					if responseErr != nil || billingErr != nil || budgetErr != nil || quotaErr != nil {
+					actualJSON, actualErr := json.Marshal(actualRecords)
+					if responseErr != nil || billingErr != nil || budgetErr != nil || quotaErr != nil || actualErr != nil {
 						s.markFailed(runID, "failed", "settlement_encode_failed")
 						send(ctx, events, Event{Type: EventRunFailed, Error: &Error{Status: http.StatusInternalServerError, Code: "settlement_failed", Message: "settlement could not be persisted", RequestID: runID}})
 						return
@@ -354,8 +381,10 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 						PriceVersion: billing.PriceVersion, Currency: billing.Currency,
 						InputUnitPrice: billing.UnitPrices.InputPerMillion, OutputUnitPrice: billing.UnitPrices.OutputPerMillion,
 						InputCharge: billing.Charges.Input, OutputCharge: billing.Charges.Output, TotalCharge: billing.Charges.Total,
-						BudgetJSON: budgetJSON,
-						QuotaJSON:  quotaJSON,
+						BudgetJSON:       budgetJSON,
+						QuotaJSON:        quotaJSON,
+						ProviderID:       deployment.ProviderID,
+						UpstreamCostJSON: actualJSON,
 					})
 					cancelPersist()
 					if persistErr != nil {
@@ -380,6 +409,55 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 			}
 		}
 	}
+}
+
+type actualRecord struct {
+	Unit         string `json:"unit"`
+	Source       string `json:"source"`
+	InputCharge  string `json:"input"`
+	OutputCharge string `json:"output"`
+	TotalCharge  string `json:"total"`
+}
+
+func calculateActualRecords(deployment Deployment, usage pricing.BillableUsage, reported []provider.CostObservation) []actualRecord {
+	records := make([]actualRecord, 0, 2)
+	reportedUnits := make(map[string]struct{}, len(reported))
+	for _, item := range reported {
+		unit := strings.ToUpper(strings.TrimSpace(item.Unit))
+		if unit == "" && deployment.ActualPrice != nil {
+			unit = deployment.ActualPrice.Currency
+		}
+		if unit == "" {
+			unit = "UNSPECIFIED"
+		}
+		total, err := pricing.ParseDecimal(item.Total)
+		if err != nil || total.Nanos() < 0 {
+			continue
+		}
+		input := ""
+		if value, parseErr := pricing.ParseDecimal(item.Input); parseErr == nil && value.Nanos() >= 0 {
+			input = value.String()
+		}
+		output := ""
+		if value, parseErr := pricing.ParseDecimal(item.Output); parseErr == nil && value.Nanos() >= 0 {
+			output = value.String()
+		}
+		records = append(records, actualRecord{Unit: unit, Source: "provider_reported", InputCharge: input, OutputCharge: output, TotalCharge: total.String()})
+		reportedUnits[unit] = struct{}{}
+	}
+	if deployment.ActualPrice != nil {
+		_, alreadyReported := reportedUnits[strings.ToUpper(deployment.ActualPrice.Currency)]
+		if settlement, err := pricing.Calculate(*deployment.ActualPrice, usage); err == nil && !alreadyReported {
+			records = append(records, actualRecord{Unit: deployment.ActualPrice.Currency, Source: "configured_estimate", InputCharge: settlement.InputCharge.String(), OutputCharge: settlement.OutputCharge.String(), TotalCharge: settlement.TotalCharge.String()})
+		}
+	}
+	if deployment.ActualPoints != nil {
+		_, alreadyReported := reportedUnits["POINTS"]
+		if settlement, err := pricing.Calculate(*deployment.ActualPoints, usage); err == nil && !alreadyReported {
+			records = append(records, actualRecord{Unit: "POINTS", Source: "configured_estimate", InputCharge: settlement.InputCharge.String(), OutputCharge: settlement.OutputCharge.String(), TotalCharge: settlement.TotalCharge.String()})
+		}
+	}
+	return records
 }
 
 func (s *Service) markFailed(runID, settlementStatus, code string) {

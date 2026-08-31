@@ -1,0 +1,63 @@
+#!/bin/zsh
+set -eu
+setopt pipefail
+
+repo_root=${0:A:h:h}
+service_label=cc.hominal.llmserver
+service_domain="gui/$(id -u)/${service_label}"
+binary_path="${repo_root}/dist/llmserver"
+public_config="${repo_root}/configs/config.yaml"
+secret_config="${repo_root:h}/xconfigs/llmserver/xconfig.yaml"
+account_name=$(id -un)
+account_home=${HOME}
+node_binary=$(command -v node 2>/dev/null || true)
+
+start_service() {
+  if [[ -z "${node_binary}" ]]; then
+    print -u2 "node is required by the WorkBuddy adapter"
+    exit 1
+  fi
+  mkdir -p "${repo_root}/dist" "${repo_root}/var"
+  (cd "${repo_root}" && go build -o "${repo_root}/dist/llmserver.next" ./cmd/llmserver)
+  mv "${repo_root}/dist/llmserver.next" "${binary_path}"
+  launchctl remove "${service_label}" 2>/dev/null || true
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "${service_domain}" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  launchctl submit -l "${service_label}" \
+    -o "${repo_root}/var/llmserver.stdout.log" \
+    -e "${repo_root}/var/llmserver.stderr.log" -- \
+    /usr/bin/env -i \
+    "HOME=${account_home}" "USER=${account_name}" "LOGNAME=${account_name}" \
+    SHELL=/bin/zsh TMPDIR=/tmp LANG=zh_CN.UTF-8 \
+    "PATH=${node_binary:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "${binary_path}" -config "${public_config}" -xconfig "${secret_config}"
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -fsS http://127.0.0.1:4815/readyz >/dev/null 2>&1; then
+      print "llmserver is ready"
+      print "API:   http://127.0.0.1:4815/v1"
+      print "Admin: http://127.0.0.1:4816/admin/"
+      return
+    fi
+    sleep 1
+  done
+  print -u2 "llmserver did not become ready; inspect ${repo_root}/var/llmserver.stderr.log"
+  exit 1
+}
+
+status_service() {
+  if launchctl print "${service_domain}" 2>/dev/null | awk '/state =|pid =|runs =|last exit code =/ {print}'; then
+    curl -fsS http://127.0.0.1:4815/readyz 2>/dev/null || true
+  else
+    print "llmserver is not registered"
+    exit 1
+  fi
+}
+
+case "${1:-start}" in
+  start|restart) start_service ;;
+  stop) launchctl remove "${service_label}" ;;
+  status) status_service ;;
+  *) print -u2 "usage: $0 {start|restart|stop|status}"; exit 2 ;;
+esac

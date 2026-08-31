@@ -53,6 +53,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"WORKBUDDY_
 	if final.Usage.InputTokens.Value != 6281 || final.Usage.OutputTokens.Value != 79 {
 		t.Fatalf("usage=%#v", final.Usage)
 	}
+	if len(final.Costs) != 1 || final.Costs[0].Unit != "USD" || final.Costs[0].Total != "999.000000000" {
+		t.Fatalf("costs=%#v", final.Costs)
+	}
 }
 
 func TestAdapterFailsClosedOnToolUse(t *testing.T) {

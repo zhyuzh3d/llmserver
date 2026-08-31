@@ -98,3 +98,38 @@ func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
 		t.Fatalf("quota = %s", stored)
 	}
 }
+
+func TestUsageSummarySeparatesPublicChargeAndActualEstimate(t *testing.T) {
+	repository, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	reservation := gateway.RunReservation{RunID: "req_usage", ClientID: "device", DeploymentID: "model", Fingerprint: "fingerprint"}
+	if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
+		t.Fatalf("reserve created=%t err=%v", created, err)
+	}
+	if err := repository.MarkRunning(context.Background(), reservation.RunID); err != nil {
+		t.Fatal(err)
+	}
+	completion := gateway.RunCompletion{
+		RunID: reservation.RunID, ProviderID: "api", ResponseJSON: []byte(`{"id":"resp_usage"}`), BillingJSON: []byte(`{"request_id":"req_usage"}`),
+		InputTokens: 10, OutputTokens: 5, InputSource: "provider_reported", OutputSource: "estimated_v1",
+		PriceVersion: "public", Currency: "USD", InputUnitPrice: "2.000000000", OutputUnitPrice: "12.000000000",
+		InputCharge: "0.000020000", OutputCharge: "0.000060000", TotalCharge: "0.000080000",
+		UpstreamCostJSON: []byte(`[{"unit":"CNY","source":"configured_estimate","total":"0.000040000"}]`),
+	}
+	if err := repository.Complete(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := repository.UsageSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Deployments) != 1 || summary.Deployments[0].PublicTotal != "0.000080000" {
+		t.Fatalf("public summary = %#v", summary.Deployments)
+	}
+	if len(summary.Actual) != 1 || summary.Actual[0].Unit != "CNY" || summary.Actual[0].Total != "0.000040000" || summary.Actual[0].Source != "configured_estimate" {
+		t.Fatalf("actual summary = %#v", summary.Actual)
+	}
+}

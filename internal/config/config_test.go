@@ -9,155 +9,139 @@ import (
 	"testing"
 )
 
-func TestLoadXConfigImportsOnlyLLMAndKeepsSecretOpaque(t *testing.T) {
+func TestLoadFilesMergesSecretsWithoutMakingThemMarshallable(t *testing.T) {
 	dir := t.TempDir()
-	xconfigPath := filepath.Join(dir, "xconfig.yaml")
-	xconfig := `
-social_accounts:
-  example:
-    password: never-read-this
-llm:
-  provider: OpenAI
-  models:
-    terra:
-      id: gpt-test
-      input_usd_per_million: 2
-      output_usd_per_million: 12
-      supported_reasoning_efforts: [low, medium]
-  cognitive_resource:
-    price_table_version: test-v1
-  providers:
-    OpenAI:
-      name: OpenAI
-      base_url: https://example.test/v1
-      wire_api: responses
-      requires_openai_auth: true
-  credentials:
-    environment:
-      OPENAI_API_KEY: top-secret-key
-`
-	if err := os.WriteFile(xconfigPath, []byte(xconfig), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := LoadXConfig(xconfigPath, "api-test")
+	publicPath := filepath.Join(dir, "config.yaml")
+	secretPath := filepath.Join(dir, "xconfig.yaml")
+	writeFile(t, publicPath, testPublicConfig("127.0.0.1:4816"))
+	writeFile(t, secretPath, `
+version: 1
+client_tokens:
+  device: device-secret-value
+provider_api_keys:
+  api: upstream-secret-value
+`)
+	cfg, secrets, err := LoadFiles(publicPath, secretPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := result.Provider.APIKey.Reveal(); got != "top-secret-key" {
-		t.Fatalf("credential mismatch")
+	if cfg.Clients[0].Token.Reveal() != "device-secret-value" || cfg.Providers[0].APIKey.Reveal() != "upstream-secret-value" {
+		t.Fatal("secrets were not merged")
 	}
-	if len(result.Deployments) != 1 || result.Deployments[0].ID != "terra" {
-		t.Fatalf("unexpected deployments: %#v", result.Deployments)
-	}
-	if strings.Contains(result.Provider.DisplayName, "top-secret-key") {
-		t.Fatal("secret leaked into display data")
-	}
-	formatted := fmt.Sprintf("%v %#v", result.Provider.APIKey, result.Provider.APIKey)
-	encoded, err := json.Marshal(result.Provider.APIKey)
+	encoded, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(formatted+string(encoded), "top-secret-key") {
-		t.Fatal("secret leaked through formatting or JSON")
+	formatted := fmt.Sprintf("%v %#v", cfg.Clients[0].Token, cfg.Providers[0].APIKey)
+	if strings.Contains(string(encoded)+formatted, "secret-value") {
+		t.Fatal("secret leaked through config serialization")
+	}
+	if secrets.ClientTokens["device"] == "" {
+		t.Fatal("secret source was not returned")
 	}
 }
 
-func TestLoadAppliesManualPriceWithHighestPriority(t *testing.T) {
+func TestSaveFilesSeparatesPublicAndSecretValues(t *testing.T) {
 	dir := t.TempDir()
-	xconfigPath := filepath.Join(dir, "xconfig.yaml")
-	serverPath := filepath.Join(dir, "llmserver.yaml")
-	writeFile(t, xconfigPath, `
-llm:
-  provider: OpenAI
-  models:
-    terra:
-      id: gpt-test
-      input_usd_per_million: 2
-      output_usd_per_million: 12
-  cognitive_resource:
-    price_table_version: test-v1
-  providers:
-    OpenAI:
-      name: OpenAI
-      base_url: https://example.test
-      wire_api: responses
-  credentials:
-    environment:
-      OPENAI_API_KEY: secret
-`)
-	writeFile(t, serverPath, `
-xconfig_import:
-  enabled: true
-  path: xconfig.yaml
-  provider_id: api-test
+	publicPath := filepath.Join(dir, "configs", "config.yaml")
+	secretPath := filepath.Join(dir, "xconfigs", "llmserver", "xconfig.yaml")
+	cfg := Config{
+		Version:     1,
+		Server:      ServerConfig{Listen: "127.0.0.1:4815", AdminListen: "127.0.0.1:4816", StatePath: filepath.Join(dir, "state.db")},
+		Clients:     []ClientConfig{{ID: "device", AllowedDeployments: []string{"model"}, Token: NewSecret("must-not-be-public")}},
+		Providers:   []ProviderConfig{{ID: "api", Type: "openai_responses", BaseURL: "https://example.test/v1", WireAPI: "responses", APIKey: NewSecret("must-not-be-public")}},
+		Deployments: []DeploymentConfig{{ID: "model", ProviderID: "api", UpstreamModel: "upstream", Enabled: true, Price: PriceConfig{Revision: "v1", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"}}},
+	}
+	secrets := SecretConfig{Version: 1, ClientTokens: map[string]string{"device": "device-secret"}, ProviderAPIKeys: map[string]string{"api": "api-secret"}}
+	if err := SaveFiles(publicPath, secretPath, cfg, secrets); err != nil {
+		t.Fatal(err)
+	}
+	publicRaw, _ := os.ReadFile(publicPath)
+	secretRaw, _ := os.ReadFile(secretPath)
+	if strings.Contains(string(publicRaw), "secret") || !strings.Contains(string(secretRaw), "device-secret") {
+		t.Fatalf("configuration separation failed")
+	}
+	info, err := os.Stat(secretPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("secret mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestAdminListenMustRemainLoopback(t *testing.T) {
+	dir := t.TempDir()
+	publicPath := filepath.Join(dir, "config.yaml")
+	secretPath := filepath.Join(dir, "xconfig.yaml")
+	writeFile(t, publicPath, testPublicConfig("0.0.0.0:4816"))
+	writeFile(t, secretPath, "version: 1\nclient_tokens: {device: token}\nprovider_api_keys: {api: key}\n")
+	if _, _, err := LoadFiles(publicPath, secretPath); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("non-loopback admin address was accepted: %v", err)
+	}
+}
+
+func TestBootstrapCreatesDurableClientTokenWithoutInventingProviderKey(t *testing.T) {
+	dir := t.TempDir()
+	publicPath := filepath.Join(dir, "configs", "config.yaml")
+	secretPath := filepath.Join(dir, "xconfigs", "llmserver", "xconfig.yaml")
+	writeFile(t, publicPath, testPublicConfig("127.0.0.1:4816"))
+	changed, err := BootstrapSecretFile(publicPath, secretPath)
+	if err != nil || !changed {
+		t.Fatalf("changed=%t err=%v", changed, err)
+	}
+	_, first, err := LoadFiles(publicPath, secretPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := first.ClientTokens["device"]
+	if len(token) != 64 || first.ProviderAPIKeys["api"] != "" {
+		t.Fatalf("unexpected bootstrap result: token length=%d provider key present=%t", len(token), first.ProviderAPIKeys["api"] != "")
+	}
+	changed, err = BootstrapSecretFile(publicPath, secretPath)
+	if err != nil || changed {
+		t.Fatalf("second bootstrap changed=%t err=%v", changed, err)
+	}
+	_, second, err := LoadFiles(publicPath, secretPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ClientTokens["device"] != token {
+		t.Fatal("bootstrap rotated an existing client token")
+	}
+}
+
+func testPublicConfig(adminListen string) string {
+	return `
+version: 1
+server:
+  listen: 127.0.0.1:4815
+  admin_listen: ` + adminListen + `
+  state_path: state.db
 clients:
-  - id: test-client
-    token_env: TEST_TOKEN
-    allowed_deployments: [terra]
-manual_prices:
-  - deployment_id: terra
-    revision: manual-v2
-    currency: USD
-    input_per_million: "3.000000"
-    output_per_million: "15.000000"
-`)
-
-	cfg, err := Load(serverPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	price := cfg.Deployments[0].Price
-	if price.Source != "manual_override" || price.Revision != "manual-v2" || price.InputPerMillion != "3.000000" {
-		t.Fatalf("manual price was not applied: %#v", price)
-	}
-}
-
-func TestLoadExplicitAPIProviderReadsCredentialFromEnvironment(t *testing.T) {
-	dir := t.TempDir()
-	serverPath := filepath.Join(dir, "llmserver.yaml")
-	t.Setenv("TEST_UPSTREAM_API_KEY", "environment-only-secret")
-	writeFile(t, serverPath, `
+  - id: device
+    allowed_deployments: [model]
 providers:
-  - id: api-test
+  - id: api
     type: openai_responses
     base_url: https://example.test/v1
     wire_api: responses
-    api_key_env: TEST_UPSTREAM_API_KEY
+    default_public_price: {revision: default, currency: USD, input_per_million: "1", output_per_million: "2"}
 deployments:
-  - id: test-model
-    provider_id: api-test
-    upstream_model: upstream-test-model
+  - id: model
+    provider_id: api
+    upstream_model: upstream
     enabled: true
     hard_budget_supported: true
-    price:
-      revision: test-price-v1
-      currency: USD
-      input_per_million: "1"
-      output_per_million: "2"
-clients:
-  - id: device
-    token_env: TEST_CLIENT_TOKEN
-    allowed_deployments: [test-model]
-`)
-	cfg, err := Load(serverPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Providers[0].APIKey.Reveal(); got != "environment-only-secret" {
-		t.Fatal("provider did not resolve the environment credential")
-	}
-	encoded, err := json.Marshal(cfg.Providers[0].APIKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encoded), "environment-only-secret") {
-		t.Fatal("resolved secret leaked through JSON")
-	}
+    price: {revision: v1, currency: USD, input_per_million: "1", output_per_million: "2"}
+`
 }
 
 func writeFile(t *testing.T, path, contents string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

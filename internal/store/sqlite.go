@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zhyuzh3d/llmserver/internal/gateway"
+	"github.com/zhyuzh3d/llmserver/internal/pricing"
 	_ "modernc.org/sqlite"
 )
 
@@ -71,6 +73,9 @@ func (s *SQLite) initialize(ctx context.Context) error {
 		WHERE status IN ('accepted', 'running')`, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("recover incomplete runs: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		return fmt.Errorf("optimize SQLite: %w", err)
 	}
 	return nil
 }
@@ -199,6 +204,14 @@ func (s *SQLite) Complete(ctx context.Context, completion gateway.RunCompletion)
 			return err
 		}
 	}
+	if len(completion.UpstreamCostJSON) > 0 && string(completion.UpstreamCostJSON) != "null" && string(completion.UpstreamCostJSON) != "[]" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO upstream_cost_records(run_id, provider_id, payload_json, observed_at)
+			VALUES(?, ?, ?, ?)`, completion.RunID, completion.ProviderID, completion.UpstreamCostJSON, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+	}
 	result, err := tx.ExecContext(ctx, `
 		UPDATE runs SET status = 'completed', settlement_status = 'confirmed', response_json = ?, billing_json = ?, updated_at = ?
 		WHERE id = ? AND status IN ('accepted', 'running')`,
@@ -230,6 +243,158 @@ func nullableBytes(value []byte) any {
 	return value
 }
 
+type UsageSummary struct {
+	Deployments []DeploymentUsage `json:"deployments"`
+	Actual      []ActualUsage     `json:"actual"`
+	Quotas      []QuotaUsage      `json:"quotas"`
+}
+
+type DeploymentUsage struct {
+	DeploymentID string `json:"deployment_id"`
+	Runs         int64  `json:"runs"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+	Currency     string `json:"currency"`
+	PublicTotal  string `json:"public_total"`
+}
+
+type ActualUsage struct {
+	ProviderID   string `json:"provider_id"`
+	DeploymentID string `json:"deployment_id"`
+	Unit         string `json:"unit"`
+	Source       string `json:"source"`
+	Total        string `json:"total"`
+}
+
+type QuotaUsage struct {
+	DeploymentID string          `json:"deployment_id"`
+	ObservedAt   string          `json:"observed_at"`
+	Observations json.RawMessage `json:"observations"`
+}
+
+func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
+	var summary UsageSummary
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.deployment_id, ru.input_tokens, ru.output_tokens, rc.currency, rc.total_charge
+		FROM runs r JOIN run_usage ru ON ru.run_id = r.id JOIN run_charges rc ON rc.run_id = r.id
+		WHERE r.status = 'completed' AND r.settlement_status = 'confirmed'
+		ORDER BY r.created_at`)
+	if err != nil {
+		return summary, err
+	}
+	deploymentIndex := map[string]int{}
+	for rows.Next() {
+		var deploymentID, currency, totalText string
+		var inputTokens, outputTokens int64
+		if err := rows.Scan(&deploymentID, &inputTokens, &outputTokens, &currency, &totalText); err != nil {
+			rows.Close()
+			return summary, err
+		}
+		key := deploymentID + "\x00" + currency
+		index, exists := deploymentIndex[key]
+		if !exists {
+			index = len(summary.Deployments)
+			deploymentIndex[key] = index
+			summary.Deployments = append(summary.Deployments, DeploymentUsage{DeploymentID: deploymentID, Currency: currency, PublicTotal: "0.000000000"})
+		}
+		item := &summary.Deployments[index]
+		item.Runs++
+		item.InputTokens += inputTokens
+		item.OutputTokens += outputTokens
+		current, parseErr := pricing.ParseDecimal(item.PublicTotal)
+		if parseErr != nil {
+			rows.Close()
+			return summary, parseErr
+		}
+		value, parseErr := pricing.ParseDecimal(totalText)
+		if parseErr != nil {
+			rows.Close()
+			return summary, parseErr
+		}
+		sum, addErr := current.Add(value)
+		if addErr != nil {
+			rows.Close()
+			return summary, addErr
+		}
+		item.PublicTotal = sum.String()
+	}
+	if err := rows.Close(); err != nil {
+		return summary, err
+	}
+
+	actualRows, err := s.db.QueryContext(ctx, `
+		SELECT u.provider_id, r.deployment_id, u.payload_json
+		FROM upstream_cost_records u JOIN runs r ON r.id = u.run_id
+		WHERE r.status = 'completed' ORDER BY u.observed_at`)
+	if err != nil {
+		return summary, err
+	}
+	type record struct {
+		Unit   string `json:"unit"`
+		Source string `json:"source"`
+		Total  string `json:"total"`
+	}
+	actualIndex := map[string]int{}
+	for actualRows.Next() {
+		var providerID, deploymentID string
+		var payload []byte
+		if err := actualRows.Scan(&providerID, &deploymentID, &payload); err != nil {
+			actualRows.Close()
+			return summary, err
+		}
+		var records []record
+		if err := json.Unmarshal(payload, &records); err != nil {
+			continue
+		}
+		for _, row := range records {
+			key := providerID + "\x00" + deploymentID + "\x00" + row.Unit + "\x00" + row.Source
+			index, exists := actualIndex[key]
+			if !exists {
+				index = len(summary.Actual)
+				actualIndex[key] = index
+				summary.Actual = append(summary.Actual, ActualUsage{ProviderID: providerID, DeploymentID: deploymentID, Unit: row.Unit, Source: row.Source, Total: "0.000000000"})
+			}
+			current, parseErr := pricing.ParseDecimal(summary.Actual[index].Total)
+			if parseErr != nil {
+				continue
+			}
+			value, parseErr := pricing.ParseDecimal(row.Total)
+			if parseErr != nil {
+				continue
+			}
+			sum, addErr := current.Add(value)
+			if addErr == nil {
+				summary.Actual[index].Total = sum.String()
+			}
+		}
+	}
+	if err := actualRows.Close(); err != nil {
+		return summary, err
+	}
+
+	quotaRows, err := s.db.QueryContext(ctx, `
+		SELECT r.deployment_id, q.observed_at, q.payload_json
+		FROM run_quota_observations q JOIN runs r ON r.id = q.run_id
+		ORDER BY q.observed_at DESC LIMIT 50`)
+	if err != nil {
+		return summary, err
+	}
+	for quotaRows.Next() {
+		var item QuotaUsage
+		var payload []byte
+		if err := quotaRows.Scan(&item.DeploymentID, &item.ObservedAt, &payload); err != nil {
+			quotaRows.Close()
+			return summary, err
+		}
+		item.Observations = append(json.RawMessage(nil), payload...)
+		summary.Quotas = append(summary.Quotas, item)
+	}
+	if err := quotaRows.Close(); err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -251,6 +416,7 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_client_created_idx ON runs(client_id, created_at);
+CREATE INDEX IF NOT EXISTS runs_deployment_status_idx ON runs(deployment_id, status);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     client_id TEXT NOT NULL,
@@ -291,6 +457,7 @@ CREATE TABLE IF NOT EXISTS run_quota_observations (
     payload_json BLOB NOT NULL,
     observed_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS run_quota_observations_run_time_idx ON run_quota_observations(run_id, observed_at);
 
 CREATE TABLE IF NOT EXISTS upstream_cost_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -299,6 +466,7 @@ CREATE TABLE IF NOT EXISTS upstream_cost_records (
     payload_json BLOB NOT NULL,
     observed_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS upstream_cost_records_provider_time_idx ON upstream_cost_records(provider_id, observed_at);
 
 CREATE TABLE IF NOT EXISTS compatibility_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

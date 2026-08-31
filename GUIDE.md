@@ -1,45 +1,30 @@
-# llmserver 客户端接入指南
+# llmserver 接入指南
 
-本文面向需要从本机或局域网设备调用 llmserver 的开发者。调用方只需要知道服务地址、设备 Token 和允许使用的公开模型 ID，不需要理解上游是标准 API、Codex 还是 WorkBuddy。
+调用方只需要三个信息：服务器地址、分配给本设备的 Bearer Token，以及 `/v1/models` 返回的公开模型 ID。调用方不需要知道模型实际来自标准 API、Codex 还是 WorkBuddy。
 
-## 1. 接入前准备
+## 获取地址和 Token
 
-服务端管理员需要提供：
+本机地址为 `http://127.0.0.1:4815`。局域网设备应把 `127.0.0.1` 替换为运行 llmserver 的 Mac 局域网 IP，端口保持 `4815`。
 
-- API Base URL，例如 `http://127.0.0.1:4815` 或受 TLS 保护的局域网地址；
-- 分配给当前设备的 Bearer Token；
-- 当前设备允许使用的模型列表；
-- 是否允许返回订阅额度观测。
+管理员在本机打开 `http://127.0.0.1:4816/admin/`，进入“访问设备”，为每台设备创建独立 Token、勾选允许模型并保存。Token 是持久值，除非管理员点击“重新生成”或手工修改，否则服务重启不会改变它。
 
-设备 Token 应一机一个。不要把 Token 放在 URL、客户端日志、Git 仓库或前端公开源码中。
+不要把 Token 放进 URL、Git 仓库、浏览器公开前端、客户端日志或崩溃报告。
 
-## 2. 健康检查和模型列表
-
-健康检查不需要鉴权：
+## 健康检查和模型列表
 
 ```bash
+export LLMSERVER_BASE_URL='http://192.168.1.20:4815'
+export LLMSERVER_API_KEY='管理员分配的设备 Token'
+
 curl "$LLMSERVER_BASE_URL/healthz"
 curl "$LLMSERVER_BASE_URL/readyz"
-```
-
-查询当前设备可用模型需要 Bearer Token：
-
-```bash
 curl "$LLMSERVER_BASE_URL/v1/models" \
   -H "Authorization: Bearer $LLMSERVER_API_KEY"
 ```
 
-`/v1/models` 只返回当前设备策略允许且已启用的 Deployment。客户端应使用这里返回的 `id`，不能直接使用供应商内部模型名。
+这里的环境变量只是客户端命令示例；llmserver 服务端不读取环境变量配置。`/v1/models` 只返回当前设备获准且已启用的公开模型。
 
-当前示例配置包括：
-
-- `luna`、`terra`、`sol`：上层 `xconfig.yaml` 导入的标准 API Deployment；
-- `codex-luna`、`codex-terra`、`codex-sol`：当前用户 Codex 登录态；
-- `workbuddy-hy4-preview`：当前用户 WorkBuddy 登录态。
-
-实际列表以 `/v1/models` 为准。
-
-## 3. 非流式 Responses 请求
+## 非流式 Responses 请求
 
 ```bash
 curl "$LLMSERVER_BASE_URL/v1/responses" \
@@ -53,9 +38,7 @@ curl "$LLMSERVER_BASE_URL/v1/responses" \
   }'
 ```
 
-`input` 可以是字符串，也可以是合法 JSON 结构。当前版本支持文本输出，不支持 function tools；`store=true` 会被拒绝。
-
-典型成功响应：
+成功响应包含 OpenAI Responses 风格结果和 `llmserver_billing`：
 
 ```json
 {
@@ -63,14 +46,12 @@ curl "$LLMSERVER_BASE_URL/v1/responses" \
   "object": "response",
   "status": "completed",
   "model": "codex-luna",
-  "output": [
-    {
-      "type": "message",
-      "role": "assistant",
-      "status": "completed",
-      "content": [{"type": "output_text", "text": "..."}]
-    }
-  ],
+  "output": [{
+    "type": "message",
+    "role": "assistant",
+    "status": "completed",
+    "content": [{"type": "output_text", "text": "..."}]
+  }],
   "usage": {
     "input_tokens": 100,
     "output_tokens": 20,
@@ -79,7 +60,7 @@ curl "$LLMSERVER_BASE_URL/v1/responses" \
   "llmserver_billing": {
     "request_id": "req_...",
     "settlement_status": "confirmed",
-    "price_version": "price_...",
+    "price_version": "...",
     "currency": "USD",
     "usage": {"input_tokens": 100, "output_tokens": 20},
     "unit_prices": {
@@ -95,46 +76,39 @@ curl "$LLMSERVER_BASE_URL/v1/responses" \
 }
 ```
 
-公开费用始终按 Deployment 配置的输入/输出价格和本次公开计费 Token 计算。供应商自己的成本字段不会改变响应费用。供应商没有报告某一维度 Token 时，llmserver 使用字数估算，估算值直接成为该次公开计费量。
+公开费用只按管理台配置的模型输入/输出单价计算。供应商实报成本不进入这个字段。若供应商缺少输入或输出 Token，llmserver 会用字符数近似估算，该估算量就是本次公开计费量。
 
-## 4. SSE 流式请求
-
-在请求体中设置 `"stream": true`：
+## SSE 流式请求
 
 ```bash
 curl -N "$LLMSERVER_BASE_URL/v1/responses" \
   -H "Authorization: Bearer $LLMSERVER_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model":"workbuddy-hy4-preview",
-    "input":"写一句问候语",
-    "stream":true
-  }'
+  -d '{"model":"workbuddy-hy4-preview","input":"写一句问候语","stream":true}'
 ```
 
-事件顺序通常为：
+主要事件顺序：
 
 ```text
 response.created
-response.output_text.delta (零到多次)
+response.output_text.delta
 llmserver.billing.completed
 response.completed
 [DONE]
 ```
 
-客户端只有收到 `llmserver.billing.completed` 或最终 `response.completed` 中的 `settlement_status=confirmed`，才能把价格视为确认结算。连接中断时不要自行假定费用为零；可以用同一幂等键重试查询已完成结果。
+只有收到 `llmserver.billing.completed`，或最终响应中的 `settlement_status=confirmed`，才能把金额视为确认结算。连接中断后应使用同一幂等键重试，不要自行假定费用为零。
 
-## 5. OpenAI SDK 接入
+## OpenAI SDK
 
 Python：
 
 ```python
-import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url=os.environ["LLMSERVER_BASE_URL"] + "/v1",
-    api_key=os.environ["LLMSERVER_API_KEY"],
+    base_url="http://192.168.1.20:4815/v1",
+    api_key="设备 Token",
 )
 
 response = client.responses.create(
@@ -151,8 +125,8 @@ JavaScript：
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: `${process.env.LLMSERVER_BASE_URL}/v1`,
-  apiKey: process.env.LLMSERVER_API_KEY,
+  baseURL: "http://192.168.1.20:4815/v1",
+  apiKey: "设备 Token",
 });
 
 const response = await client.responses.create({
@@ -163,31 +137,15 @@ const response = await client.responses.create({
 console.log(response.output_text);
 ```
 
-某些 SDK 会丢弃未知扩展字段。业务若必须读取 `llmserver_billing`，建议直接使用 HTTP/JSON，或确认所用 SDK 能保留原始响应。
+部分 SDK 会丢弃未知扩展字段。业务若必须读取 `llmserver_billing`，应确认 SDK 保留原始响应，或直接使用 HTTP/JSON。
 
-## 6. 幂等键
+## 可选预算
 
-网络超时后重试时，在私有 `llmserver` 字段中携带稳定幂等键：
-
-```json
-{
-  "model": "codex-luna",
-  "input": "只回复 OK",
-  "llmserver": {
-    "idempotency_key": "device-operation-20260830-0001"
-  }
-}
-```
-
-幂等键在单个客户端设备范围内生效。相同 Key 和相同请求会返回已确认结果而不再次调用上游；相同 Key 用于不同请求会返回 `409 idempotency_key_reused`。未完成或失败的原请求不会被服务器偷偷重放。
-
-## 7. 请求预算
-
-预算可选，不设置时按实际公开计费量正常结算：
+不设置预算时，服务照常按本次实际公开计费量结算。预算不是预付金额：
 
 ```json
 {
-  "model": "api-model",
+  "model": "luna",
   "input": "...",
   "max_output_tokens": 256,
   "llmserver": {
@@ -200,63 +158,39 @@ console.log(response.output_text);
 }
 ```
 
-- `hard`：只在 Deployment 明确声明可执行时支持；调用前按输入估算和最大输出量检查。Codex/WorkBuddy 当前明确不支持 hard budget；
-- `soft`：最终结算会标记是否超过预算，但当前版本不保证中途停止，可能 overshoot；
-- `max_charge` 不是预付金额，也不是固定收费。最终费用始终按实际公开计费量计算。
+`hard` 只用于能够在调用前约束最大输出量的标准 API Deployment，并要求 `max_output_tokens`。Codex/WorkBuddy 不保证硬上限。`soft` 只在结算后标记是否超额，不能保证中途停止。
 
-## 8. 额度观测
+## 幂等重试
 
-额度返回由服务端针对设备统一配置：
-
-```yaml
-include_quota_observations: true
+```json
+{
+  "model": "codex-luna",
+  "input": "只回复 OK",
+  "llmserver": {
+    "idempotency_key": "device-operation-20260831-0001"
+  }
+}
 ```
 
-调用方不能在单次请求里自行开启。关闭时响应完全省略 `quota_observations`。开启后，Codex 可能返回多个相互独立的百分比窗口，包括调用前、调用后、变化量、窗口长度和重置时间。
+幂等键按设备隔离。相同 Key 和相同请求会返回已确认结果，不再次调用上游；相同 Key 用于不同请求返回 `409`。
 
-这些值是共享账号快照：桌面端或其他请求可能同时消耗额度，所以 delta 不能被解释为本请求的精确成本，也不能换算成美元。WorkBuddy 当前没有可靠的公开额度读取路径，因此不会伪造额度字段。
+## 额度观测
 
-## 9. 严格兼容模式
+额度信息由管理员按设备统一开关，调用方不能单次请求自行开启。开启后，Codex 响应可能附带多个共享账号限额窗口的调用前百分比、调用后百分比和变化量。它们不是本请求的精确美元成本，也不能跨不同窗口直接相加。
 
-发送以下 Header 可获得不含 llmserver 扩展字段的 Responses 结果：
+WorkBuddy 当前实报总美元成本但不提供积分余额接口。后台手工设置的积分费率属于“配置估算”，不会作为供应商实报额度返回。
 
-```text
-x-llmserver-compatibility: strict
-```
+## 严格兼容模式
 
-严格模式仍会返回 `x-llmserver-request-id`，但会省略 `llmserver_billing` 和对应 SSE 结算事件。需要展示费用的客户端不要启用严格模式。
+发送 `x-llmserver-compatibility: strict` 会省略 `llmserver_billing` 和自定义 SSE 结算事件，但仍返回 `x-llmserver-request-id`。需要显示费用的客户端不要启用该模式。
 
-## 10. 错误和重试
-
-常见状态：
+## 常见错误
 
 - `401 invalid_api_key`：设备 Token 缺失或错误；
-- `403 model_not_allowed`：当前设备无权使用该 Deployment；
+- `403 model_not_allowed`：设备未获准使用该公开模型；
 - `404 unknown_model_deployment`：模型不存在或被禁用；
 - `409 idempotency_key_reused` / `idempotency_in_progress`：幂等冲突；
-- `422 hard_budget_not_enforceable`：该模型不能保证 hard budget；
-- `502 provider_start_failed` / `provider_stream_failed`：本机应用、登录态、版本或上游服务异常。
+- `422 hard_budget_not_enforceable`：该模型无法执行 hard budget；
+- `502 provider_start_failed` / `provider_stream_failed`：供应商、本机登录态或程序版本异常。
 
-只应对确认未完成、且语义允许重试的请求进行重试。使用稳定幂等键；不要因为收到 5xx 就生成新 Key 并重复计费。
-
-## 11. 局域网接入
-
-当前服务没有内建 TLS。最安全的当前部署方式是：
-
-```text
-局域网设备 → HTTPS/mTLS 安全入口 → 127.0.0.1:4815 llmserver
-```
-
-保持 llmserver 监听回环地址，由同机反向代理、VPN 或零信任入口负责 TLS、来源限制和证书。不要把设备 Bearer Token 通过明文 HTTP 发送到普通 Wi-Fi 网络。
-
-如果临时把 `server.listen` 改为 `0.0.0.0:4815`，这只适合完全隔离且可信的测试网络，不构成正式安全部署。当前 Codex/WorkBuddy Adapter 仍以当前 macOS 用户权限运行，LAN 发布前还需要更强的操作系统级文件、网络、Keychain 和 GUI 隔离。
-
-## 12. 客户端安全清单
-
-- 每台物理设备独立 Token，并只允许所需模型；
-- Token 存放在系统 Keychain、受保护环境变量或后端 secret store；
-- 不在浏览器公开前端、移动端日志或崩溃报告中打印 Token；
-- 校验 HTTPS 证书，不关闭 TLS 验证；
-- 保存 `x-llmserver-request-id` 和幂等键用于诊断；
-- 金额使用响应中的十进制定点字符串，不转成二进制浮点数后再累计；
-- 只把 `settlement_status=confirmed` 视为确认结算。
+局域网 HTTP 没有加密能力，只适合可信隔离网络。跨不可信网络必须增加 HTTPS/mTLS、VPN 或零信任入口。

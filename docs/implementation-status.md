@@ -1,62 +1,50 @@
-# llmServer 实现状态
+# llmserver 实现状态
 
-> 更新时间：2026-08-30
-> 原则：这里只记录已经由代码和测试证明的事实，不把设计计划写成已完成功能。
+> 更新时间：2026-08-31
+> 本文只记录已经由代码、自动测试或受控真实调用证明的事实。
 
-## 当前里程碑
+## 当前状态
 
-Stage 1 核心链路与 Stage 2/3 的首个真实 Adapter 已经可运行，但完整安全和运维退出门尚未满足，因此当前版本只适合本机回环开发和受控测试，不应直接作为 LAN 发布版。
+Stage 1 结算主链、Stage 2 Codex Adapter、Stage 3 WorkBuddy Adapter和本机管理台已经可运行。API 已作为 macOS 用户级常驻任务监听 `0.0.0.0:4815`，管理台只监听 `127.0.0.1:4816`。
 
 已实现：
 
-- 仅解析上层 `xconfig.yaml` 的 `llm` 节点，密钥使用不透明类型并在格式化、JSON、YAML 中脱敏；
-- 独立配置的标准 API Provider 支持通过 `api_key_env` 从进程环境解析密钥，无需把真实值写入 YAML；
-- 手工公开价格覆盖目录默认价，输入价与输出价使用 9 位小数定点运算；
-- `text_estimator_v1` 按维度填补上游缺失的输入或输出 Token，估算结果直接作为公开 billable usage；
-- Bearer Token 鉴权、按客户端 Deployment allowlist、`GET /v1/models`；
-- `POST /v1/responses` 非流式和 SSE、客户端取消、严格模式、请求体和基础能力校验；
-- 标准 Responses HTTP/SSE Adapter，私有 `llmserver` 请求扩展不会传给上游；
-- 上游响应字段白名单，避免兼容供应商注入的 instructions、tools、路由键或账号元数据泄漏给调用方；
-- 可选 hard/soft budget 的当前基础语义；hard 在缺失 `max_output_tokens` 时调用前拒绝；
-- SQLite accepted/running/completed/failed 状态、usage 来源、价格快照、金额、崩溃恢复和客户端范围内幂等键；
-- 结算成功写盘后才发出 billing/completed，持久化失败不会伪造 confirmed；
-- Codex/WorkBuddy 直接复用当前 macOS 用户在官方程序中的登录态；llmserver 不读取、复制、记录或返回登录凭据；
-- Codex 逐 Run `exec --json --ephemeral` Adapter，版本前缀门、临时 cwd、单并发、最小环境、进程组取消和本地工具事件失败关闭；
-- Codex 调用前后经 App Server 读取多 bucket rate limits，独立保存百分比窗口；只有客户端策略开启时才返回，默认省略；
-- WorkBuddy 逐 Run headless `stream-json` Adapter，临时 cwd、单并发、禁用 tools/MCP/settings/后台任务、最小环境、进程组取消和工具内容失败关闭；
-- Codex/WorkBuddy 上游报告的 token usage 进入同一公开结算内核；上游 cost 字段不参与调用方价格；
-- Mock、伪 OpenAI 上游、金额、鉴权、取消、SSE、错误脱敏、重开恢复和幂等测试。
+- 服务端运行时只读取 `configs/config.yaml` 与上层 `xconfigs/llmserver/xconfig.yaml`；不读取环境变量、`.env`、旧 Hominal xconfig 或其他配置文件；
+- 秘密 xconfig 权限 `0600`，设备 Token 首次生成后持久保存；配置对象序列化和普通管理状态接口不会返回秘密值；
+- `GET /healthz`、`GET /readyz`、鉴权后的 `GET /v1/models`；
+- `POST /v1/responses` 非流式与 SSE、客户端取消、严格兼容模式和请求校验；
+- 标准 Responses HTTP/SSE Provider，本机 Codex `exec --json --ephemeral` Provider，本机 WorkBuddy headless `stream-json` Provider；
+- Provider 动态模型发现：标准 `/v1/models`、Codex App Server `model/list`、WorkBuddy CLI 公布的支持列表；
+- 本机 Web 管理台：Provider/Key、默认公开价格、模型刷新与发布、模型价格、实际成本/积分费率、设备 Token/白名单、额度返回开关和消耗统计；
+- 配置保存前完整验证；成功写盘后，使用原子运行快照让新请求热生效；在途请求继续使用旧快照；
+- 每个 Deployment 独立公开输入价、输出价与版本，9 位小数定点结算；
+- 上游未报告某一维 Token 时使用 `text_estimator_v1` 字符估算，估算量直接成为本次公开计费量；
+- 可选 hard/soft budget；hard 只对明确可执行且提供 `max_output_tokens` 的 Deployment 开放；
+- SQLite 记录 accepted/running/completed/failed、usage 来源、公开价格快照、金额、幂等和崩溃恢复；
+- 供应商结构化 cost/total_cost 作为 `provider_reported` 单独入库；未实报时可用 `actual_price` / `actual_points` 作为 `configured_estimate`；两者均不改变调用方费用；
+- Codex 经 App Server 读取多个 rate-limit 窗口并单独入库；只有设备策略开启时才向调用方返回；
+- WorkBuddy 记录 CLI 实报 `total_cost_usd`；当前版本没有可靠积分余额接口，不伪造积分实报；
+- 管理端限制回环来源、拒绝跨站修改请求，并设置 CSP、禁止 iframe 与 no-store；
+- `launchctl submit` 常驻脚本使用清洁环境启动，不把调用任务中的无关 Token 继承到服务进程；异常退出由 launchd 拉起，系统重启后需手工重新注册。
 
-受控真实测试使用用户授权的上层 `xconfig.yaml`，未调用 Hominal：
+## 2026-08-31 真实验证
 
-- `luna` 非流式返回“正常”，上游报告 4688 输入、5 输出 Token，公开结算 `0.000943600 USD`；
-- `luna` SSE 返回 `OK`，上游报告 4685 输入、5 输出 Token，公开结算 `0.000943000 USD`；
-- 完成后的相同幂等请求约 0.00085 秒从 SQLite 返回，没有再次调用上游；
-- 首次真实响应暴露出兼容供应商回显内部 instructions/tools 的问题，之后已改成公开字段白名单并通过第二次真实测试。
+- 标准 API、Codex、WorkBuddy 均成功刷新当前可用模型；分别返回 10、7、15 个模型；
+- `luna` 返回 `OK`，公开结算确认，输入 4685 Token、输出 5 Token、总价 `0.000943000 USD`；
+- `codex-luna` 返回 `OK`，公开结算确认，输入 12777 Token、输出 5 Token、总价 `0.002561400 USD`；额度快照已入库且默认不向调用方返回；
+- `workbuddy-hy4-preview` 返回 `OK`，公开结算确认，输入 3096 Token、输出 57 Token、总价 `0.006876000 USD`；CLI 实报美元成本已进入独立实际消耗表；
+- 管理页、状态接口和消耗汇总接口返回 200；普通状态响应与常驻进程环境均未包含配置秘密值；伪造跨站修改请求返回 403；
+- API 监听所有本机接口，管理台只监听 IPv4 loopback；
+- 自动测试覆盖配置分离、密钥脱敏、配置热更新、设备改名 Token 迁移、模型发现、管理端来源限制、公开/实际消耗分离、鉴权、金额、SSE、取消、幂等和数据库恢复。
 
-Stage 2/3 真实受控测试直接使用当前已登录用户额度，未调用 Hominal：
+## 明确未实现或未证明
 
-- `codex-luna` 返回 `CODEX_QUOTA_RETRY_OK`，上游报告 12832 输入、11 输出 Token，按配置价结算 `0.002579600 USD`；
-- 同一 Codex Run 前后观测到 `codex` 周窗口，以及 Spark 的 5 小时和周窗口。本次供应商百分比粒度未变化，三个 delta 均为 0；这些共享账号快照已落库且默认客户端响应未返回；
-- `workbuddy-hy4-preview` 返回 `WORKBUDDY_STAGE3_FINAL_OK`，上游报告 3175 输入、150 输出 Token，按配置价结算 `0.008150000 USD`；
-- 两个 Adapter 都用诱导读取项目 README 的提示做了只读安全 smoke，均拒绝读取且未向响应返回文件内容。这个结果不能替代操作系统级副作用隔离证明。
-
-## 尚未达到的 Stage 1 退出门
-
-- `/v1/chat/completions`、单函数工具和结构化输出；
-- `/llmserver/v1/capabilities`、请求查询和完整管理 CLI；
-- 客户端每分钟速率、并发、队列、期限、来源 IP 与更细输入/输出限制；
-- LAN 非回环监听时的 TLS 强制启动门；
-- WorkBuddy credits/百分比额度尚无可靠公开读取路径；Codex 已实现，统一 bucket 结构仍需扩展 string/decimal credits 单位；
-- soft budget 的中途 usage 观测、取消和 overshoot 解释；
-- Standard API 更完整的错误分类、慢消费者、超时和首字节前安全重试；
-- 配置 revision、Provider/Deployment/Price revision 的完整 SQLite 快照；
-- LaunchAgent、滚动脱敏日志和安装/升级/卸载流程。
-
-## Stage 2/3 剩余门槛
-
-本机验证版本是 `codex-cli 0.151.0-alpha.7.1` 和 WorkBuddy `2.115.0`。版本发生变化时，当前前缀门会拒绝启动，必须先更新 fixture 和兼容判断。
-
-两个 Adapter 的提示词、空目录、禁用工具、拒绝审批和事件失败关闭是纵深防御，不是完整安全边界。Codex 的 `read-only` sandbox 仍可能允许读取本机其他文件；WorkBuddy 的工具禁用也还没有用操作系统审计证明所有版本均无网络、Keychain、剪贴板或 GUI 副作用。因此配置仍只监听回环，不能直接开放到 LAN。
-
-还需补齐冻结 fake CLI/App Server fixture、真实取消与崩溃恢复测试、慢消费者和排队期限、结构化输出/function tools、WorkBuddy quota、Provider 健康状态、LaunchAgent，以及 LAN TLS/mTLS 或反向代理强制门。Codex 额度观测依赖独立 App Server 刷新，失败时只记录 `unavailable`，不会推翻已完成的价格结算。
+- `/v1/chat/completions`、function tools、结构化输出和完整 OpenAI API 覆盖；
+- 客户端每分钟速率、并发队列、来源 IP allowlist 和更细输入/输出限制；
+- 内建 TLS。当前 LAN 监听只适用于可信隔离网络；不可信网络必须增加 HTTPS/mTLS、VPN 或零信任入口；
+- WorkBuddy 积分余额或积分变化的供应商实报；后台积分费率只能作为配置估算；
+- soft budget 中途取消和 overshoot 上限；
+- Standard API 全部供应商私有 cost 格式。当前仅解析安全、结构化的常见 `cost` / `total_cost` 形态；
+- 配置两个 YAML 之间的跨文件崩溃事务。每个文件独立原子替换，运行快照只在两者均保存成功后切换，但操作系统在两次 rename 之间断电仍不是分布式原子事务；
+- 系统重启后自动启动。当前按用户要求只保证本次登录会话内常驻；重启后执行 `scripts/llmserver-service start`；
+- 完整操作系统沙箱。Codex/WorkBuddy 已禁用工具、使用临时目录和最小环境并对工具事件失败关闭，但仍复用当前 macOS 用户登录态，不应被视为强隔离边界。

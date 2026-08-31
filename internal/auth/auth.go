@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 
 	"github.com/zhyuzh3d/llmserver/internal/config"
@@ -30,10 +28,7 @@ type Authenticator struct {
 func FromConfig(clients []config.ClientConfig) (*Authenticator, error) {
 	result := &Authenticator{}
 	for _, clientConfig := range clients {
-		token := os.Getenv(clientConfig.TokenEnv)
-		if token == "" {
-			return nil, fmt.Errorf("client %q token environment variable %q is empty", clientConfig.ID, clientConfig.TokenEnv)
-		}
+		token := clientConfig.Token.Reveal()
 		result.clients = append(result.clients, NewClient(clientConfig.ID, token, clientConfig.AllowedDeployments, clientConfig.IncludeQuotaObservations))
 	}
 	return result, nil

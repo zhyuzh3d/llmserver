@@ -221,7 +221,7 @@ fixture 应固定 Codex 版本和 schema hash，并保留“输入协议 → 输
 
 ### Slice 6：恢复与发布状态
 
-完成进程重启、Provider 状态、LaunchAgent 集成和脱敏诊断。退出条件是崩溃不重放请求，恢复后新请求可用，历史结算不丢失。
+完成进程重启、Provider 状态、用户级 `launchctl` 常驻和脱敏诊断。退出条件是崩溃不重放请求，恢复后新请求可用，历史结算不丢失。
 
 ## 12. Stage 2 退出门
 
