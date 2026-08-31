@@ -40,6 +40,7 @@ func main() {
 	if err != nil {
 		fatal("configure runtime", err)
 	}
+	defer manager.Close()
 	apiServer := api.NewDynamicServer(manager.Current)
 	adminServer := admin.New(manager, runStore)
 

@@ -39,6 +39,7 @@ deployments:
 	if err != nil {
 		t.Fatal(err)
 	}
+	initialAdapter := manager.Snapshot().Adapters["api"]
 	updated := *manager.Snapshot().Config
 	updated.Clients = append([]config.ClientConfig(nil), updated.Clients...)
 	updated.Clients[0].ID = "new-device"
@@ -58,12 +59,25 @@ deployments:
 	if manager.Snapshot().Config.Clients[0].ID != "new-device" {
 		t.Fatal("runtime snapshot was not swapped")
 	}
+	if !sameAdapter(initialAdapter, manager.Snapshot().Adapters["api"]) {
+		t.Fatal("client-only update unnecessarily rebuilt provider adapter")
+	}
 	publicRaw, err := os.ReadFile(publicPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(publicRaw), "client-secret") || strings.Contains(string(publicRaw), "provider-secret") {
 		t.Fatal("secret leaked into public config")
+	}
+
+	changedProvider := *manager.Snapshot().Config
+	changedProvider.Providers = append([]config.ProviderConfig(nil), changedProvider.Providers...)
+	changedProvider.Providers[0].BaseURL = "https://changed.example.test/v1"
+	if err := manager.Update(context.Background(), Update{Config: changedProvider}); err != nil {
+		t.Fatal(err)
+	}
+	if sameAdapter(initialAdapter, manager.Snapshot().Adapters["api"]) {
+		t.Fatal("provider transport change reused stale adapter")
 	}
 }
 

@@ -15,6 +15,7 @@ type Request struct {
 	Input           json.RawMessage
 	CanonicalInput  string
 	MaxOutputTokens *int64
+	ReasoningEffort string
 	RawRequest      json.RawMessage
 }
 
@@ -39,7 +40,6 @@ type Final struct {
 	EffectiveModel string
 	Usage          pricing.ReportedUsage
 	Costs          []CostObservation
-	Quota          []QuotaObservation
 }
 
 type CostObservation struct {
@@ -49,19 +49,14 @@ type CostObservation struct {
 	Total  string
 }
 
-type QuotaObservation struct {
-	LimitID               string   `json:"limit_id"`
-	Unit                  string   `json:"unit"`
-	Before                *float64 `json:"before,omitempty"`
-	After                 *float64 `json:"after,omitempty"`
-	Delta                 *float64 `json:"delta,omitempty"`
-	WindowDurationMinutes *int64   `json:"window_duration_minutes,omitempty"`
-	ResetsAt              *int64   `json:"resets_at,omitempty"`
-	Status                string   `json:"status"`
-	Attribution           string   `json:"attribution"`
-}
-
 type Adapter interface {
 	ID() string
 	Start(context.Context, Request) (<-chan Event, error)
+}
+
+// Retirable is implemented by adapters that own persistent local resources.
+// Retirement rejects new work, closes idle resources immediately and lets
+// requests already in flight finish before their resources are closed.
+type Retirable interface {
+	Retire()
 }

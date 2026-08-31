@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/zhyuzh3d/llmserver/internal/auth"
 	"github.com/zhyuzh3d/llmserver/internal/config"
@@ -22,6 +25,7 @@ type Snapshot struct {
 	Secrets       *config.SecretConfig
 	Authenticator *auth.Authenticator
 	Gateway       *gateway.Service
+	Adapters      map[string]provider.Adapter
 }
 
 type Manager struct {
@@ -110,11 +114,13 @@ func (m *Manager) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	snapshot, err := m.build(ctx, cfg, secrets)
+	current := m.current.Load()
+	snapshot, err := m.build(ctx, cfg, secrets, current)
 	if err != nil {
 		return err
 	}
-	m.current.Store(snapshot)
+	old := m.current.Swap(snapshot)
+	retireSnapshotExcept(old, snapshot)
 	return nil
 }
 
@@ -146,35 +152,85 @@ func (m *Manager) Update(ctx context.Context, update Update) error {
 	if err != nil {
 		return err
 	}
-	snapshot, err := m.build(ctx, resolved, &secrets)
+	snapshot, err := m.build(ctx, resolved, &secrets, current)
 	if err != nil {
 		return err
 	}
 	if err := config.SaveFiles(m.publicPath, m.secretPath, update.Config, secrets); err != nil {
+		retireSnapshotExcept(snapshot, current)
 		return err
 	}
-	m.current.Store(snapshot)
+	old := m.current.Swap(snapshot)
+	retireSnapshotExcept(old, snapshot)
 	return nil
 }
 
-func (m *Manager) build(ctx context.Context, cfg *config.Config, secrets *config.SecretConfig) (*Snapshot, error) {
+// Close retires the current runtime's persistent local provider workers.
+func (m *Manager) Close() {
+	retireSnapshotExcept(m.current.Swap(nil), nil)
+}
+
+func retireSnapshotExcept(snapshot, keep *Snapshot) {
+	if snapshot == nil {
+		return
+	}
+	for id, adapter := range snapshot.Adapters {
+		if keep != nil && sameAdapter(adapter, keep.Adapters[id]) {
+			continue
+		}
+		if retirable, ok := adapter.(provider.Retirable); ok {
+			retirable.Retire()
+		}
+	}
+}
+
+func sameAdapter(left, right provider.Adapter) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
+	return leftValue.Type() == rightValue.Type() && leftValue.Kind() == reflect.Pointer && leftValue.Pointer() == rightValue.Pointer()
+}
+
+func (m *Manager) build(ctx context.Context, cfg *config.Config, secrets *config.SecretConfig, reuse *Snapshot) (*Snapshot, error) {
 	authenticator, err := auth.FromConfig(cfg.Clients)
 	if err != nil {
 		return nil, err
 	}
 	adapters := make([]provider.Adapter, 0, len(cfg.Providers))
+	adapterByID := make(map[string]provider.Adapter, len(cfg.Providers))
+	newAdapters := make([]provider.Adapter, 0, len(cfg.Providers))
+	retireBuiltAdapters := func() {
+		for _, adapter := range newAdapters {
+			if retirable, ok := adapter.(provider.Retirable); ok {
+				retirable.Retire()
+			}
+		}
+	}
 	for _, providerConfig := range cfg.Providers {
 		if err := ctx.Err(); err != nil {
+			retireBuiltAdapters()
 			return nil, err
 		}
+		if reusable := reusableAdapter(reuse, providerConfig); reusable != nil {
+			adapters = append(adapters, reusable)
+			adapterByID[providerConfig.ID] = reusable
+			continue
+		}
+		var built provider.Adapter
 		if m.mockResponse != "" {
-			adapters = append(adapters, &mock.Adapter{ProviderID: providerConfig.ID, ResponseText: m.mockResponse})
+			built = &mock.Adapter{ProviderID: providerConfig.ID, ResponseText: m.mockResponse}
+			adapters = append(adapters, built)
+			adapterByID[providerConfig.ID] = built
+			newAdapters = append(newAdapters, built)
 			continue
 		}
 		switch providerConfig.Type {
 		case "openai_responses":
 			if providerConfig.APIKey.IsEmpty() {
-				adapters = append(adapters, unavailableAdapter{id: providerConfig.ID, reason: "provider API key is not configured"})
+				built = unavailableAdapter{id: providerConfig.ID, reason: "provider API key is not configured"}
+				adapters = append(adapters, built)
+				adapterByID[providerConfig.ID] = built
 				continue
 			}
 			adapter, adapterErr := openaiadapter.NewConfigured(openaiadapter.Config{
@@ -182,37 +238,85 @@ func (m *Manager) build(ctx context.Context, cfg *config.Config, secrets *config
 				APIKey: providerConfig.APIKey, APIKeyHeader: providerConfig.APIKeyHeader, APIKeyPrefix: providerConfig.APIKeyPrefix,
 			}, nil)
 			if adapterErr != nil {
+				retireBuiltAdapters()
 				return nil, fmt.Errorf("configure provider %s: %w", providerConfig.ID, adapterErr)
 			}
-			adapters = append(adapters, adapter)
+			built = adapter
 		case "codex_exec":
 			adapter, adapterErr := codexadapter.New(codexadapter.Config{
 				ProviderID: providerConfig.ID, Executable: providerConfig.Executable,
 				ExpectedVersion: providerConfig.ExpectedVersion, ExtraArgs: providerConfig.ExtraArgs,
-				ObserveQuota: providerConfig.ObserveQuota,
+				MaxConcurrency:   providerConfig.MaxConcurrency,
+				DefaultReasoning: providerConfig.DefaultReasoning, ServiceTier: providerConfig.ServiceTier,
 			})
 			if adapterErr != nil {
+				retireBuiltAdapters()
 				return nil, fmt.Errorf("configure provider %s: %w", providerConfig.ID, adapterErr)
 			}
-			adapters = append(adapters, adapter)
+			built = adapter
 		case "workbuddy_exec":
 			adapter, adapterErr := workbuddyadapter.New(workbuddyadapter.Config{
 				ProviderID: providerConfig.ID, Executable: providerConfig.Executable,
 				ExpectedVersion: providerConfig.ExpectedVersion, ExtraArgs: providerConfig.ExtraArgs,
+				MaxConcurrency:   providerConfig.MaxConcurrency,
+				DefaultReasoning: providerConfig.DefaultReasoning,
+				WarmupEnabled:    providerConfig.WarmupEnabled, WarmupModel: providerConfig.WarmupModel,
+				WarmupTimeout: time.Duration(providerConfig.WarmupTimeoutSecs) * time.Second,
 			})
 			if adapterErr != nil {
+				retireBuiltAdapters()
 				return nil, fmt.Errorf("configure provider %s: %w", providerConfig.ID, adapterErr)
 			}
-			adapters = append(adapters, adapter)
+			built = adapter
 		default:
+			retireBuiltAdapters()
 			return nil, fmt.Errorf("unsupported provider type %q", providerConfig.Type)
 		}
+		adapters = append(adapters, built)
+		adapterByID[providerConfig.ID] = built
+		newAdapters = append(newAdapters, built)
 	}
 	gatewayService, err := gateway.NewService(cfg.Deployments, adapters, gateway.WithRunRepository(m.repository))
 	if err != nil {
+		retireBuiltAdapters()
 		return nil, err
 	}
-	return &Snapshot{Config: cfg, Secrets: secrets, Authenticator: authenticator, Gateway: gatewayService}, nil
+	return &Snapshot{Config: cfg, Secrets: secrets, Authenticator: authenticator, Gateway: gatewayService, Adapters: adapterByID}, nil
+}
+
+func reusableAdapter(snapshot *Snapshot, candidate config.ProviderConfig) provider.Adapter {
+	if snapshot == nil {
+		return nil
+	}
+	for _, existing := range snapshot.Config.Providers {
+		if sameProviderRuntime(existing, candidate) {
+			return snapshot.Adapters[candidate.ID]
+		}
+	}
+	return nil
+}
+
+func sameProviderRuntime(left, right config.ProviderConfig) bool {
+	if left.ID != right.ID || left.Type != right.Type {
+		return false
+	}
+	switch left.Type {
+	case "openai_responses":
+		return left.BaseURL == right.BaseURL && left.ResponsesURL == right.ResponsesURL &&
+			left.APIKeyHeader == right.APIKeyHeader && left.APIKeyPrefix == right.APIKeyPrefix &&
+			left.WireAPI == right.WireAPI && left.APIKey.Reveal() == right.APIKey.Reveal()
+	case "codex_exec":
+		return left.Executable == right.Executable && left.ExpectedVersion == right.ExpectedVersion &&
+			slices.Equal(left.ExtraArgs, right.ExtraArgs) && left.MaxConcurrency == right.MaxConcurrency &&
+			left.DefaultReasoning == right.DefaultReasoning && left.ServiceTier == right.ServiceTier
+	case "workbuddy_exec":
+		return left.Executable == right.Executable && left.ExpectedVersion == right.ExpectedVersion &&
+			slices.Equal(left.ExtraArgs, right.ExtraArgs) && left.MaxConcurrency == right.MaxConcurrency &&
+			left.DefaultReasoning == right.DefaultReasoning && left.WarmupEnabled == right.WarmupEnabled &&
+			left.WarmupModel == right.WarmupModel && left.WarmupTimeoutSecs == right.WarmupTimeoutSecs
+	default:
+		return false
+	}
 }
 
 type unavailableAdapter struct {

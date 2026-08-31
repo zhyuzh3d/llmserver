@@ -48,7 +48,6 @@ type RunCompletion struct {
 	OutputCharge     string
 	TotalCharge      string
 	BudgetJSON       []byte
-	QuotaJSON        []byte
 	ProviderID       string
 	UpstreamCostJSON []byte
 }

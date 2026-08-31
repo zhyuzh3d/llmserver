@@ -36,10 +36,9 @@ type ServerConfig struct {
 }
 
 type ClientConfig struct {
-	ID                       string   `yaml:"id" json:"id"`
-	AllowedDeployments       []string `yaml:"allowed_deployments" json:"allowed_deployments"`
-	IncludeQuotaObservations bool     `yaml:"include_quota_observations" json:"include_quota_observations"`
-	Token                    Secret   `yaml:"-" json:"-"`
+	ID                 string   `yaml:"id" json:"id"`
+	AllowedDeployments []string `yaml:"allowed_deployments" json:"allowed_deployments"`
+	Token              Secret   `yaml:"-" json:"-"`
 }
 
 type ProviderConfig struct {
@@ -55,7 +54,12 @@ type ProviderConfig struct {
 	Executable         string      `yaml:"executable,omitempty" json:"executable,omitempty"`
 	ExpectedVersion    string      `yaml:"expected_version,omitempty" json:"expected_version,omitempty"`
 	ExtraArgs          []string    `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
-	ObserveQuota       bool        `yaml:"observe_quota,omitempty" json:"observe_quota,omitempty"`
+	MaxConcurrency     int         `yaml:"max_concurrency,omitempty" json:"max_concurrency,omitempty"`
+	DefaultReasoning   string      `yaml:"default_reasoning_effort,omitempty" json:"default_reasoning_effort,omitempty"`
+	ServiceTier        string      `yaml:"service_tier,omitempty" json:"service_tier,omitempty"`
+	WarmupEnabled      bool        `yaml:"warmup_enabled,omitempty" json:"warmup_enabled,omitempty"`
+	WarmupModel        string      `yaml:"warmup_model,omitempty" json:"warmup_model,omitempty"`
+	WarmupTimeoutSecs  int         `yaml:"warmup_timeout_seconds,omitempty" json:"warmup_timeout_seconds,omitempty"`
 	DefaultPublicPrice PriceConfig `yaml:"default_public_price" json:"default_public_price"`
 	APIKey             Secret      `yaml:"-" json:"-"`
 }
@@ -269,6 +273,7 @@ func (c *Config) Validate() error {
 	}
 
 	providerIDs := make(map[string]struct{}, len(c.Providers))
+	providersByID := make(map[string]ProviderConfig, len(c.Providers))
 	for _, provider := range c.Providers {
 		if provider.ID == "" {
 			return errors.New("provider id is required")
@@ -277,6 +282,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate provider id %q", provider.ID)
 		}
 		providerIDs[provider.ID] = struct{}{}
+		providersByID[provider.ID] = provider
 		switch provider.Type {
 		case "openai_responses":
 			if provider.BaseURL == "" {
@@ -288,6 +294,27 @@ func (c *Config) Validate() error {
 		case "codex_exec", "workbuddy_exec":
 			if !filepath.IsAbs(provider.Executable) {
 				return fmt.Errorf("provider %q executable must be an absolute path", provider.ID)
+			}
+			if provider.MaxConcurrency != 0 && (provider.MaxConcurrency < 1 || provider.MaxConcurrency > 16) {
+				return fmt.Errorf("provider %q max_concurrency must be between 1 and 16", provider.ID)
+			}
+			if provider.DefaultReasoning != "" && !validReasoningEffort(provider.DefaultReasoning) {
+				return fmt.Errorf("provider %q has invalid default_reasoning_effort", provider.ID)
+			}
+			if provider.Type != "codex_exec" && provider.ServiceTier != "" {
+				return fmt.Errorf("provider %q service_tier is only supported by codex_exec", provider.ID)
+			}
+			if provider.Type == "codex_exec" && provider.ServiceTier != "" && provider.ServiceTier != "priority" {
+				return fmt.Errorf("provider %q has invalid service_tier", provider.ID)
+			}
+			if provider.Type != "workbuddy_exec" && (provider.WarmupEnabled || provider.WarmupModel != "" || provider.WarmupTimeoutSecs != 0) {
+				return fmt.Errorf("provider %q warmup settings are only supported by workbuddy_exec", provider.ID)
+			}
+			if provider.WarmupEnabled && strings.TrimSpace(provider.WarmupModel) == "" {
+				return fmt.Errorf("provider %q warmup_model is required when warmup is enabled", provider.ID)
+			}
+			if provider.WarmupTimeoutSecs != 0 && (provider.WarmupTimeoutSecs < 5 || provider.WarmupTimeoutSecs > 300) {
+				return fmt.Errorf("provider %q warmup_timeout_seconds must be between 5 and 300", provider.ID)
 			}
 		default:
 			return fmt.Errorf("provider %q has unsupported type %q", provider.ID, provider.Type)
@@ -308,6 +335,10 @@ func (c *Config) Validate() error {
 		deploymentIDs[deployment.ID] = struct{}{}
 		if _, exists := providerIDs[deployment.ProviderID]; !exists {
 			return fmt.Errorf("deployment %q references unknown provider %q", deployment.ID, deployment.ProviderID)
+		}
+		provider := providersByID[deployment.ProviderID]
+		if provider.DefaultReasoning != "" && len(deployment.SupportedReasoningEffort) > 0 && !containsString(deployment.SupportedReasoningEffort, provider.DefaultReasoning) {
+			return fmt.Errorf("provider %q default_reasoning_effort %q is not supported by deployment %q", provider.ID, provider.DefaultReasoning, deployment.ID)
 		}
 		if err := validatePrice(deployment.ID, deployment.Price); err != nil {
 			return err
@@ -343,6 +374,24 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func validReasoningEffort(value string) bool {
+	switch value {
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateAPIProvider(provider ProviderConfig) error {

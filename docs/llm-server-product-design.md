@@ -18,7 +18,7 @@ trusted local / LAN clients
 ┌──────────────────────────────────────────────────────┐
 │                      llmServer                       │
 │ auth / deployments / routing / events / settlement  │
-│ budgets / quota observations / audit / cancellation │
+│ budgets / usage / audit / cancellation              │
 ├────────────────┬────────────────┬────────────────────┤
 │ Standard API   │ Codex          │ WorkBuddy          │
 │ Adapter        │ Adapter        │ Adapter             │
@@ -42,7 +42,7 @@ trusted local / LAN clients
 - 标准 API、Codex、WorkBuddy 三类可插拔 Adapter；
 - 每次调用按公开模型配置价和本次 billable 输入/输出 Token 结算，并返回输入单价、输出单价、输入金额、输出金额和总额；
 - 可选的请求价格上限，不设置时按实际用量正常结算；
-- 上游额度的调用前、调用后、变化量和重置窗口观测；
+- 不为统计发起额外 Codex/WorkBuddy 额度、积分或余额请求；
 - 不依赖提示词的本地执行隔离、凭据隔离和审计；
 - 版本化价格表、请求幂等键、持久化结算记录和失败状态解释。
 
@@ -50,7 +50,7 @@ trusted local / LAN clients
 
 - 任何具体调用方，包括 Hominal 的代码修改或运行编排；
 - 公开互联网、多租户商业售卖和支付收款；
-- 向调用方、日志、数据库、配置或 Git 导出/下发 Codex/WorkBuddy 的 OAuth、Cookie 或登录文件；只有在官方进程无法直接复用当前用户登录态时，才允许在本机运行时目录建立最小、短生命周期凭据副本，且必须不进入项目目录并在进程结束后删除；
+- 向调用方、日志、数据库、配置或 Git 导出/下发 Codex/WorkBuddy 的 OAuth、Cookie 或登录文件；Adapter 读取当前登录态或建立最小临时副本时，只能留在受限的本机进程内存/运行时目录，不得进入项目目录，并在 worker 退出后删除；
 - 默认允许远端请求通过 Codex/WorkBuddy 执行 shell、改文件、操作 GUI 或浏览器；
 - 向调用方暴露供应商真实成本、价格来源或 Codex/WorkBuddy 的内部定价方式；
 - 完整复刻 Codex、WorkBuddy 的 agent、插件、文件和终端能力；
@@ -63,8 +63,8 @@ trusted local / LAN clients
 | Stage | 交付内容 | 退出条件 |
 | --- | --- | --- |
 | Stage 1 | 标准 API 核心、统一事件、Model Deployment、客户端鉴权、价格预算与结算、本机管理面、模拟上游 | 不依赖真实供应商即可完成兼容 API、SSE、预算、结算、配置热更新和失败恢复的确定性测试 |
-| Stage 2 | Codex App Server stdio Adapter、模型/usage/多窗口额度映射、工具隔离 | 冻结的 Codex 模拟进程覆盖初始化、生成、取消、reroute、usage、配额与崩溃；无本地副作用 |
-| Stage 3 | WorkBuddy/CodeBuddy Adapter、模型/usage/credits/额度映射、工具隔离 | 冻结的 WorkBuddy 模拟进程覆盖生成、取消、usage、额度、模型漂移和权限请求；无本地副作用 |
+| Stage 2 | Codex 最小化 Responses 主链、App Server 兜底、模型/usage/原生 delta、工具隔离 | 冻结的 HTTP/stdio 模拟传输覆盖生成、取消、usage、明确回退与未知结果不重放；无本地副作用 |
+| Stage 3 | WorkBuddy ACP 常驻 Adapter、模型/usage/本次积分、工具隔离 | 冻结的 WorkBuddy ACP 模拟进程覆盖生成、取消、usage、本次积分、模型漂移和权限请求；无本地副作用 |
 
 详细开发文档：
 
@@ -111,12 +111,10 @@ deployments:
 request.accepted
 budget.evaluated
 provider.selected
-quota.before_observed
 provider.started
 output_text.delta / function_call.completed
 usage.updated
 provider.completed | provider.failed
-quota.after_observed
 settlement.completed
 response.completed
 ```
@@ -195,7 +193,7 @@ response.completed
 
 - `public_price`：llmServer 向调用方公开并用于结算的模型价格；
 - `upstream_reported_price/cost`：供应商返回或后台同步的价格、成本，只用于控制台、统计和对账；
-- `quota_observations`：订阅额度或 credits 快照，与公开价格互不换算。
+- `upstream_run_cost`：供应商随本次生成返回的成本或积分，只用于后台统计，与公开价格互不换算。
 
 供应商返回的价格永远不能直接改变本次或未来请求的公开价格。控制台对某个 Deployment 的手工修改具有最高优先级，并进入“手工锁定”状态；后续目录同步只能更新后台参考值，不能覆盖它。没有手工价时可以使用 llmServer 预置的模型默认价；供应商建议价只有被管理员或配置流程明确采纳并生成新的 PriceRevision 后才会生效。任何启用的 Deployment 最终都必须解析出完整的输入价和输出价。
 
@@ -269,57 +267,11 @@ total_charge  = input_charge + output_charge
 
 对外 OpenAI `usage.input_tokens/output_tokens` 与 `llmserver_billing.usage` 必须使用同一组 billable Token，避免一个响应出现两套数字。上游原始 usage 和更细的 cached/reasoning 字段只保存在后台；需要保留标准细分字段时，也不得改变上述公开计费总量。
 
-## 7. 配额与订阅额度
+## 7. 上游实际消耗边界
 
-配额不是价格。不同软件可能同时存在数小时、每日、每周、每月、credits、请求数或 token 等多个窗口，所以 llmServer 不定义“统一剩余额度百分比”，也不把百分比兑换成美元。
+llmServer 不主动查询 Codex/WorkBuddy 的账户额度、订阅窗口、积分余额或剩余百分比。这些数据通常是共享账号快照，无法可靠归因到单次请求，而且额外查询会直接增加主链延迟。
 
-配额属于敏感的账号运行信息，默认不向调用方返回。是否返回由客户端 API Key 的服务端策略统一控制，而不是由单次请求参数控制：
-
-```yaml
-client_credentials:
-  - id: bedroom-device
-    response_policy:
-      include_quota_observations: false
-```
-
-推荐一个物理设备使用一个独立 Key，使控制台能够针对设备启停。未来 Web 控制台修改的也是这项客户端策略；在控制台实现前由配置文件和 CLI 管理。关闭时，响应中完全省略 `quota_status` 和 `quota_observations`，而不是返回空数组暗示额度为零。打开后，所有使用该 Key 的调用都按同一规则返回，客户端不能自行越权开启。
-
-后台是否采集和保存 quota 是独立策略。即使不向调用方公开，Provider 仍可为控制台健康状态和内部记录采集；如果主动读取 before/after 会显著增加延迟，可配置为只使用 Provider 已随调用返回的值或缓存快照。
-
-统一的是返回结构，不是单位：
-
-```json
-{
-  "provider": "codex-local",
-  "limit_id": "codex",
-  "unit": "percent_used",
-  "window": {
-    "duration_seconds": 900,
-    "resets_at": "2026-08-30T12:00:00Z"
-  },
-  "before": "25.000000",
-  "after": "31.000000",
-  "delta": "6.000000",
-  "source": "provider_snapshot",
-  "confidence": "observed",
-  "attribution": "shared_account_window"
-}
-```
-
-规则如下：
-
-- 一个请求可返回零个、一个或多个 quota bucket；
-- `unit` 可为 `percent_used`、`percent_remaining`、`credits`、`tokens`、`requests` 或 Provider 扩展单位；
-- 尽可能在调用前和调用后各读取一次；`delta=after-before`，含义随单位保留；
-- 只有调用后值时，`before` 和 `delta` 为 `null`；
-- 上游刷新粒度较粗时，单次调用的 delta 可能为零，这不等于该调用没有消耗；
-- Codex/WorkBuddy 桌面端或其他 Run 可能共用同一账号，调用前后差值此时只是共享账户窗口变化，不能归因成本次请求；
-- 不合并不同窗口，不比较不同 Provider 的百分比，不根据价格反推额度；
-- quota 快照失败不改写货币结算，但必须返回 `quota_status=unavailable`。
-
-上面最后一条只适用于允许返回 quota 的客户端；默认关闭时不暴露任何 quota 状态。
-
-Codex 官方协议已经存在按 `limitId` 区分的多 bucket、`usedPercent`、窗口长度和重置时间，因此内部数据模型必须从第一天支持数组和多窗口，而不是先做一个单百分比字段再迁移。
+只有供应商随本次生成结果已经返回、且能明确归属于当前 Run 的成本或积分才进入后台实际消耗记录。Codex 当前不提供这类稳定字段，因此不记录实际额度；WorkBuddy 只采用同一次 ACP usage 事件已经返回的 credit。任何上游实际消耗都不进入调用方响应，也不改变公开价格结算。
 
 ## 8. Adapter 契约
 
@@ -328,7 +280,6 @@ type ProviderAdapter interface {
     ID() string
     Probe(context.Context) ProviderStatus
     DiscoverModels(context.Context) ([]DiscoveredModel, error)
-    ObserveQuota(context.Context) ([]QuotaObservation, error)
     Start(context.Context, RunRequest) (EventStream, error)
     Cancel(context.Context, RunID) error
     Close(context.Context) error
@@ -340,13 +291,13 @@ type ProviderAdapter interface {
 - 只接收已完成鉴权、授权、参数校验和预算判定的内部请求；
 - 输出单调序号的统一事件，不绕过主链另交最终结果；
 - 明确报告请求模型与有效模型，未知时使用 `null`；
-- 区分认证、配额、限流、协议、进程和取消错误；
-- 不把缺失 usage、价格或 quota 当作零；
+- 区分认证、限流、协议、进程和取消错误；
+- 不把缺失 usage 或价格当作零；
 - 客户端断开后传播取消；
 - 每个 Run 最多产生一次终态和一次结算；
 - 不读取或返回上游原始登录凭据。
 
-标准 API Adapter 优先透传原生 Responses/Chat Completions 和 SSE，只做必要规范化。Codex Adapter 使用同机 stdio App Server。WorkBuddy Adapter 的正式传输要在 Stage 3 原型中由“可隔离性、协议稳定性、usage 完整性”决定，不在总纲中过早锁死 ACP 或 headless 单一路径。
+标准 API Adapter 优先透传原生 Responses 和 SSE，只做必要规范化。Codex Adapter 以当前登录态的最小化 Responses SSE 为性能主链，以隔离、常驻的同机 stdio App Server 为兼容兜底；只有明确尚未开始生成的协议/鉴权 HTTP 失败可回退，结果不明的传输错误禁止重放。WorkBuddy Adapter 使用 ACP stdio 常驻 worker，每次请求创建独立 session，不复用对话历史。
 
 ## 9. 函数、会话与 agent 边界
 
@@ -362,21 +313,20 @@ Provider 自己的本地工具和调用方定义的函数是两个命名空间�
 
 - 独立的高熵客户端 Token，数据库只保存校验摘要；
 - 每个客户端的 Deployment allowlist、并发、速率、输入/输出大小和到期时间；
-- 每个客户端 Key 的响应字段策略，至少包含 `include_quota_observations`，默认 `false`；
 - TLS；内网无法可靠部署证书时，优先 SSH 隧道或受控反向代理，不以“在家里”替代认证；
 - 来源 IP allowlist 作为附加限制，而不是唯一认证；
 - 默认拒绝 CORS；
 - 管理 API 继续仅监听回环或独立 Unix socket。
 
-上游 API Key 存放 macOS Keychain。Codex/WorkBuddy 凭据由各自程序维护，Adapter 默认通过当前用户的 `HOME/CODEX_HOME` 让官方进程自行认证，不解析凭据文件。日志默认不记录 prompt、response、reasoning、工具参数、Authorization、Cookie、账号 ID 和本机敏感路径。
+上游 API Key 只存放在仓库外的 `../xconfigs/llmserver/xconfig.yaml`，权限为 `0600`。Codex/WorkBuddy 凭据仍由各自程序维护，不写入项目配置：Codex 性能主链从当前用户的 `auth.json` 读取 access token 与 account ID，只在进程内按文件修改时间缓存；App Server 兜底将当前凭据复制到权限 `0700/0600` 的临时隔离目录并在 worker 退出时删除。WorkBuddy 只让官方 ACP 进程使用当前登录态。任何凭据都不进入请求响应、日志、SQLite 或 Git。
 
 ## 11. 配置、持久化与恢复
 
 首版使用声明式 YAML/TOML 加 SQLite 状态库：
 
 - 配置文件：Provider、Deployment、Price Revision、客户端响应策略的期望状态；
-- SQLite：配置 revision、请求状态、usage、结算、quota 快照、幂等键、协议兼容结果；
-- Keychain：上游 secrets；
+- SQLite：配置 revision、请求状态、usage、结算、上游本次成本、幂等键、协议兼容结果；
+- 仓库外 xconfig：上游 secrets 与客户端 Token；
 - 版本化 fixture/schema 目录：Codex/WorkBuddy 协议样本和兼容基线。
 
 配置加载采用“解析 → 完整校验 → 生成 revision → 原子激活”。错误配置不替换当前活动 revision。每个 Run 固定 config、deployment、price revision 和 estimator version，以便进程崩溃后复算。
@@ -387,19 +337,19 @@ Provider 自己的本地工具和调用方定义的函数是两个命名空间�
 
 三个 Stage 的自动验收均不调用 Hominal，也不要求消耗真实模型额度。测试由四层组成：
 
-1. 纯单元测试：金额定点运算、价格 revision、预算、usage 合并、quota delta；
+1. 纯单元测试：金额定点运算、价格 revision、预算和 usage 合并；
 2. 协议契约测试：OpenAI 请求/响应、SSE、错误、严格兼容模式；
-3. 确定性模拟 Provider：脚本化生成、延迟、usage、配额变化、崩溃和取消；
+3. 确定性模拟 Provider：脚本化生成、延迟、usage、本次成本、崩溃和取消；
 4. 冻结上游 fixture：由已知 Codex/WorkBuddy 协议样本回放，验证版本字段映射。
 
-模拟测试只能证明 llmServer 的协议与状态机正确，不能证明当前真实账号、登录态、供应商服务或实时额度可用。真实 Codex/WorkBuddy 最小生成 smoke test 保留为人工、显式、非发布门动作；未执行时文档和版本说明必须写明“未做真实上游生成验证”。
+模拟测试只能证明 llmServer 的协议与状态机正确，不能证明当前真实账号、登录态或供应商服务可用。真实 Codex/WorkBuddy 最小生成 smoke test 保留为人工、显式、非发布门动作；未执行时文档和版本说明必须写明“未做真实上游生成验证”。
 
 关键不变量：
 
 - 同一输入/输出 usage + 同一 price revision 必须得到逐位一致的金额；
 - 每个成功响应都有结算终态，缺失 usage 不得伪造已确认；
 - hard budget 不可证明时调用前失败；
-- 不同 quota bucket 永不被合并或换算，默认不向客户端 Key 返回；
+- 不为统计增加外部额度或积分请求；
 - 输出后不跨 Provider 自动重试；
 - 客户端取消最终到达 Adapter；
 - 两个客户端之间无内容、会话、价格上限和结算串扰；
@@ -417,7 +367,6 @@ internal/api           OpenAI 兼容解析与编码
 internal/run           状态机、事件、取消、幂等
 internal/deployment    模型公开与能力策略
 internal/pricing       price revision、预算、结算
-internal/quota         多窗口额度观测
 internal/provider      Adapter SPI
 internal/providers/api
 internal/providers/codex
@@ -440,12 +389,12 @@ internal/admin          仅回环管理 API 与静态 Web 页面
 | 价格或估算算法变化造成历史账单漂移 | Run 固定不可变 price revision 和 estimator version，金额可离线复算 |
 | hard budget 实际无法保证 | 无可靠上界或取消能力时调用前拒绝，不降级成假 hard |
 | 供应商价格或模拟方式泄漏给调用方 | 公共响应只包含模型公开价格；来源、手工锁定和上游成本仅后台可见 |
-| 多种订阅额度无法统一 | 统一 bucket 数据结构，不统一单位、不换算货币 |
+| 上游账户快照无法归因且增加延迟 | 不主动查询；仅记录本次生成已返回且可归因的数据 |
 | Codex/WorkBuddy 自动切模型 | 结算绑定 Deployment；有效模型作为独立可空事实 |
 | 本地 agent 获得 Mac 权限 | 进程级隔离、拒绝审批、黑盒副作用探针，提示词不算隔离 |
 | 断线重试造成重复消费 | 幂等键、持久化 Run、输出后禁止自动重试 |
 | 事件发出后结算失败 | 结算属于主链；严格区分 completed、unconfirmed、failed |
-| Web UI 提前绑死模型 | 当前移除，待后端管理契约稳定后单独立项 |
+| Web UI 提前绑死模型 | 管理台只调用稳定管理 API，发现模型与公开 Deployment 保持分离 |
 
 ## 15. 当前明确决策
 
@@ -453,14 +402,14 @@ internal/admin          仅回环管理 API 与静态 Web 页面
 2. 所有调用方只看到 Deployment 的公开模型价格，不看到价格来源、供应商成本或模拟方式。
 3. 公开价格按总输入、总输出 billable Token 和控制台配置单价计算；上游缺失时用版本化字数估算，手工改价优先级最高。
 4. hard 上限只有在可证明时才接受，无法保证时不得假装已保证。
-5. quota 与 price 互不换算；quota 是否返回由客户端 Key 策略控制，默认关闭。
+5. 不主动查询账户额度或余额；上游本次成本与公开价格互不换算。
 6. 公开模型以显式 Model Deployment 为准，发现模型不自动公开。
-7. Web 控制台从三个开发 Stage 中移除，配置先用文件和 CLI。
+7. Web 控制台是仅回环访问的薄管理客户端，不参与请求主链和结算。
 8. 自动验收只要求模拟与 fixture 跑通；真实上游 smoke test 非发布门，且必须如实标注。
 
 ## 16. 参考资料
 
-- [OpenAI Codex App Server](https://learn.chatgpt.com/docs/app-server)
+- [OpenAI Codex App Server](https://developers.openai.com/codex/app-server/)
 - [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses)
 - [OpenAI 模型与价格比较](https://developers.openai.com/api/docs/models/compare)
 - [CodeBuddy Code HTTP API Beta](https://www.codebuddy.ai/docs/cli/http-api)

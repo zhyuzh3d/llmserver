@@ -26,9 +26,14 @@
         <div><p class="eyebrow">LLMSERVER / ADMIN</p><h1 id="page-title">概览</h1></div>
         <div class="top-actions"><span class="status-pill"><i></i>服务正常</span><button class="button primary" id="save-all">保存并生效</button></div>
       </header>
-      <div id="notice" class="notice" role="status" hidden></div>
       <section id="content" class="content" aria-live="polite"><div class="loading"><span></span><p>正在读取配置…</p></div></section>
     </main>
+  </div>
+
+  <div id="toast" class="toast" popover="manual" role="status" aria-live="polite" aria-atomic="true" aria-hidden="true">
+    <i class="toast-mark" aria-hidden="true"></i>
+    <span id="toast-message" class="toast-message"></span>
+    <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">×</button>
   </div>
 
   <dialog id="model-dialog" class="wide-dialog">

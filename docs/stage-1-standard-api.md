@@ -1,7 +1,7 @@
 # Stage 1：标准 API 与结算内核开发计划
 
 > 前置文档：[llmServer 后端产品与技术总纲](./llm-server-product-design.md)
-> 范围：标准 API Provider、公共 OpenAI 兼容接口、统一运行主链、价格与配额基础设施
+> 范围：标准 API Provider、公共 OpenAI 兼容接口、统一运行主链、价格与结算基础设施
 > 明确排除：Codex、WorkBuddy、Web 控制台、Hominal 接入、真实付费模型调用
 > 实现状态：核心 Responses 链路已通过离线与受控真实测试；本 Stage 尚未达到全部退出门，详见 [实现状态](./implementation-status.md)
 
@@ -12,7 +12,7 @@ Stage 1 要交付一个即使完全断网、没有任何真实模型账号，也
 1. OpenAI 兼容请求与响应；
 2. 流式运行与取消状态机；
 3. Model Deployment 与客户端授权；
-4. usage、可选预算、主链结算和 quota bucket。
+4. usage、可选预算和主链结算。
 
 Stage 1 完成后，Codex 与 WorkBuddy 只能作为新的 Provider Adapter 接入，不能各自发明模型 ID、用量字段、价格字段或错误语义。
 
@@ -66,7 +66,6 @@ type RunRequest struct {
 request.accepted
 budget.evaluated
 provider.selected
-quota.before_observed
 provider.started
 output_text.delta
 output_text.completed
@@ -77,7 +76,6 @@ provider.warning
 provider.completed
 provider.failed
 provider.cancelled
-quota.after_observed
 settlement.completed
 response.completed
 ```
@@ -99,7 +97,6 @@ client_policies
 runs
 run_usage
 run_charges
-run_quota_observations
 idempotency_keys
 compatibility_runs
 ```
@@ -108,7 +105,7 @@ compatibility_runs
 
 ## 4. Model Deployment 与配置
 
-配置文件使用单一声明式格式，建议 YAML。敏感值只引用 Keychain 条目，不直接写在文件中。
+公开配置使用仓库内 `configs/config.yaml`，客户端 Token 与上游 API Key 只写入仓库外 `../xconfigs/llmserver/xconfig.yaml`；服务不读取其他配置文件或环境变量。
 
 ```yaml
 providers:
@@ -161,10 +158,8 @@ authenticate client
 → count/estimate input meters
 → evaluate optional budget
 → persist accepted run and idempotency key
-→ observe quota before
 → invoke provider and consume events
 → aggregate final usage
-→ observe quota after
 → calculate and persist settlement
 → attach billing and complete response
 ```
@@ -240,8 +235,6 @@ soft 模式记录 `estimated_charge`，在收到可用 usage update 时重算当
 
 调用方看不到 `source`、手工锁定状态、供应商成本、Token 估算来源或任何“模拟定价”标记。`price_version` 是不透露来源的审计标识。后台 `run_usage` 仍要按 input/output 保存 `provider_reported|estimated_v1`、估算器版本和原始字符数。标准 OpenAI `usage` 与 `llmserver_billing.usage` 必须使用同一组 billable input/output Token。
 
-额度字段由客户端 Key 策略控制，默认完全省略。启用后才在 `llmserver_billing` 中增加 `quota_status` 和 `quota_observations`。
-
 SSE 在标准结束事件之后、`[DONE]` 之前输出一个命名明确的 `llmserver.billing.completed` 事件。严格兼容模式不发送扩展对象和自定义事件，但必须返回 request ID 响应头，结算可通过查询端点读取。
 
 Stage 1 必须用官方 SDK 的至少两个版本做解析契约测试；测试目标是“标准字段可正常消费”，不是声称所有 OpenAI SDK 功能都已实现。
@@ -268,7 +261,6 @@ Adapter 职责：
 - 每分钟请求数、最大并发、队列上限；
 - 单请求 body、输入、输出、工具数、总时长上限；
 - 是否允许图片、工具、strict 模式；
-- `include_quota_observations`，默认 `false`，单次请求不能覆盖；
 - 可选来源 IP 和到期时间。
 
 一个物理设备应使用一个独立客户端 Token。未来控制台按 Token/设备修改返回策略；当前由配置文件和 CLI 使用同一策略接口管理。
@@ -295,7 +287,7 @@ API 可在可信隔离 LAN 监听，但必须启用客户端 Token；当前版�
 
 ### Slice 5：Standard API Adapter
 
-实现上游 HTTP/SSE、Keychain 引用、错误映射、取消和 fixture server。退出条件是本地假 OpenAI Server 的全部协议场景通过，不要求真实 API Key。
+实现上游 HTTP/SSE、仓库外 xconfig 密钥引用、错误映射、取消和 fixture server。退出条件是本地假 OpenAI Server 的全部协议场景通过，不要求真实 API Key。
 
 ### Slice 6：Chat Completions 与发布骨架
 
@@ -312,7 +304,6 @@ API 可在可信隔离 LAN 监听，但必须启用客户端 Token；当前版�
 - 十进制定点舍入、极大 token、零费率、price revision 切换；
 - 无预算、hard 刚好等于上限、超过一个最小金额单位、不可执行 hard；
 - soft 取消及时、取消滞后和实际超额；
-- quota 默认不返回、按不同客户端 Key 开关、零/单/多 bucket、单位不同、before 缺失；
 - 相同幂等键并发到达、完成后重试、运行中重试、不同客户端同键；
 - Provider 在首字节前失败、输出后失败、usage 后崩溃、结算写盘失败；
 - 客户端断连、慢消费者、超大事件、超时；
@@ -332,7 +323,7 @@ API 可在可信隔离 LAN 监听，但必须启用客户端 Token；当前版�
 - 金额不使用浮点数，历史请求可凭 price revision 完整复算；
 - 每个启用模型都有输入/输出公开价，手工修改优先级最高；
 - 调用方看不到价格来源、模拟方式或供应商实际成本；
-- 配额支持数组、多窗口和多单位，按客户端 Key 控制且默认不返回；
+- 统计不会为 Codex/WorkBuddy 增加额度、积分或余额请求；
 - SSE 断连可取消 Mock 与 Standard API Adapter；
 - 幂等重试不会重复启动 Provider Run；
 - LAN 模式没有认证或 TLS 时拒绝启动；

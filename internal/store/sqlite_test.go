@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -65,48 +64,6 @@ func TestSameIdempotencyKeyIsScopedByClient(t *testing.T) {
 		if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
 			t.Fatalf("reserve %#v created=%t err=%v", reservation, created, err)
 		}
-	}
-}
-
-func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
-	repository, err := Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repository.Close()
-	reservation := gateway.RunReservation{RunID: "req_quota", ClientID: "device", DeploymentID: "codex", Fingerprint: "fingerprint"}
-	if _, created, err := repository.Reserve(context.Background(), reservation); err != nil || !created {
-		t.Fatalf("reserve created=%t err=%v", created, err)
-	}
-	if err := repository.MarkRunning(context.Background(), reservation.RunID); err != nil {
-		t.Fatal(err)
-	}
-	quota := json.RawMessage(`[{"limit_id":"codex:primary","unit":"percent_used","before":7,"after":8,"delta":1,"window_duration_minutes":10080,"resets_at":1788749661,"status":"observed","attribution":"shared_account_window"}]`)
-	completion := gateway.RunCompletion{
-		RunID: reservation.RunID, ResponseJSON: []byte(`{"id":"resp_quota"}`), BillingJSON: []byte(`{"request_id":"req_quota"}`),
-		InputTokens: 1, OutputTokens: 1, InputSource: "provider_reported", OutputSource: "provider_reported",
-		PriceVersion: "price_public", Currency: "USD", InputUnitPrice: "1.000000000", OutputUnitPrice: "1.000000000",
-		InputCharge: "0.000001000", OutputCharge: "0.000001000", TotalCharge: "0.000002000", QuotaJSON: quota,
-	}
-	if err := repository.Complete(context.Background(), completion); err != nil {
-		t.Fatal(err)
-	}
-	var stored []byte
-	if err := repository.db.QueryRow(`SELECT payload_json FROM run_quota_observations WHERE run_id = ?`, reservation.RunID).Scan(&stored); err != nil {
-		t.Fatal(err)
-	}
-	if string(stored) != string(quota) {
-		t.Fatalf("quota = %s", stored)
-	}
-	report, err := repository.UsageReport(context.Background(), UsageReportFilter{
-		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute), GroupBy: "provider",
-		ProviderByDeployment: map[string]string{"codex": "codex-local"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(report.Groups) != 1 || len(report.Groups[0].QuotaTotals) != 1 || report.Groups[0].QuotaTotals[0].Delta != 1 || report.Groups[0].QuotaTotals[0].WindowDurationMinutes == nil || *report.Groups[0].QuotaTotals[0].WindowDurationMinutes != 10080 {
-		t.Fatalf("quota report = %#v", report.Groups)
 	}
 }
 

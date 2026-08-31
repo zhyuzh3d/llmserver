@@ -81,6 +81,60 @@ func TestAdminListenMustRemainLoopback(t *testing.T) {
 	}
 }
 
+func TestSystemProviderPerformanceSettingsMustMatchDeployment(t *testing.T) {
+	cfg := Config{
+		Version: 1,
+		Server:  ServerConfig{Listen: "127.0.0.1:4815", AdminListen: "127.0.0.1:4816"},
+		Clients: []ClientConfig{{ID: "device", Token: NewSecret("token"), AllowedDeployments: []string{"model"}}},
+		Providers: []ProviderConfig{{
+			ID: "codex", Type: "codex_exec", Executable: "/bin/true", MaxConcurrency: 2,
+			DefaultReasoning: "minimal", ServiceTier: "priority",
+			DefaultPublicPrice: PriceConfig{Revision: "default", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+		Deployments: []DeploymentConfig{{
+			ID: "model", ProviderID: "codex", UpstreamModel: "upstream", SupportedReasoningEffort: []string{"low", "high"},
+			Price: PriceConfig{Revision: "v1", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("unsupported provider default was accepted: %v", err)
+	}
+	cfg.Providers[0].DefaultReasoning = "low"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid performance settings were rejected: %v", err)
+	}
+}
+
+func TestWorkBuddyWarmupSettingsAreBounded(t *testing.T) {
+	provider := ProviderConfig{
+		ID: "workbuddy", Type: "workbuddy_exec", Executable: "/bin/true", MaxConcurrency: 2,
+		DefaultReasoning: "high", WarmupEnabled: true, WarmupModel: "hy4-preview", WarmupTimeoutSecs: 30,
+		DefaultPublicPrice: PriceConfig{Revision: "default", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+	}
+	cfg := Config{
+		Version:   1,
+		Server:    ServerConfig{Listen: "127.0.0.1:4815", AdminListen: "127.0.0.1:4816"},
+		Clients:   []ClientConfig{{ID: "device", Token: NewSecret("token"), AllowedDeployments: []string{"model"}}},
+		Providers: []ProviderConfig{provider},
+		Deployments: []DeploymentConfig{{
+			ID: "model", ProviderID: "workbuddy", UpstreamModel: "hy4-preview", SupportedReasoningEffort: []string{"high"},
+			Price: PriceConfig{Revision: "v1", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid WorkBuddy warmup settings were rejected: %v", err)
+	}
+	cfg.Providers[0].WarmupModel = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "warmup_model") {
+		t.Fatalf("missing warmup model was accepted: %v", err)
+	}
+	cfg.Providers[0] = provider
+	cfg.Providers[0].WarmupTimeoutSecs = 301
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "warmup_timeout_seconds") {
+		t.Fatalf("unbounded warmup timeout was accepted: %v", err)
+	}
+}
+
 func TestBootstrapCreatesDurableClientTokenWithoutInventingProviderKey(t *testing.T) {
 	dir := t.TempDir()
 	publicPath := filepath.Join(dir, "configs", "config.yaml")

@@ -18,7 +18,7 @@ func TestRunUsesReportedInputAndEstimatedOutput(t *testing.T) {
 		ResponseText:  "你好abcd",
 		ReportedInput: &reportedInput,
 	})
-	client := auth.NewClient("device", "secret", []string{"terra"}, false)
+	client := auth.NewClient("device", "secret", []string{"terra"})
 	events, _, err := service.Start(context.Background(), client, Request{
 		Model:          "terra",
 		CanonicalInput: "ignored",
@@ -51,7 +51,7 @@ func TestRunUsesReportedInputAndEstimatedOutput(t *testing.T) {
 func TestRunRejectsUnauthorizedDeploymentBeforeProviderStart(t *testing.T) {
 	adapter := &countingAdapter{Adapter: mock.Adapter{ProviderID: "mock", ResponseText: "ok"}}
 	service := newTestService(t, adapter)
-	client := auth.NewClient("device", "secret", []string{"sol"}, false)
+	client := auth.NewClient("device", "secret", []string{"sol"})
 	_, _, err := service.Start(context.Background(), client, Request{Model: "terra"})
 	if err == nil {
 		t.Fatal("unauthorized request unexpectedly started")
@@ -64,7 +64,7 @@ func TestRunRejectsUnauthorizedDeploymentBeforeProviderStart(t *testing.T) {
 func TestHardBudgetRejectsBeforeProviderStart(t *testing.T) {
 	adapter := &countingAdapter{Adapter: mock.Adapter{ProviderID: "mock", ResponseText: "ok"}}
 	service := newTestService(t, adapter)
-	client := auth.NewClient("device", "secret", []string{"terra"}, false)
+	client := auth.NewClient("device", "secret", []string{"terra"})
 	maxOutput := int64(300)
 	_, _, err := service.Start(context.Background(), client, Request{
 		Model:           "terra",
@@ -100,30 +100,6 @@ func TestPublicResponseDoesNotLeakProviderInjectedConfiguration(t *testing.T) {
 	}
 	if response["id"] != "resp_abc" || response["model"] != "luna" {
 		t.Fatalf("public identity was not normalized: %#v", response)
-	}
-}
-
-func TestQuotaIsReturnedOnlyForEnabledClientPolicy(t *testing.T) {
-	before, after, delta := 6.0, 7.0, 1.0
-	adapter := &mock.Adapter{ProviderID: "mock", ResponseText: "ok", Quota: []provider.QuotaObservation{{
-		LimitID: "codex:primary", Unit: "percent_used", Before: &before, After: &after, Delta: &delta,
-		Status: "observed", Attribution: "shared_account_window",
-	}}}
-	service := newTestService(t, adapter)
-	for _, test := range []struct {
-		include bool
-		want    int
-	}{{false, 0}, {true, 1}} {
-		client := auth.NewClient("device", "secret", []string{"terra"}, test.include)
-		events, _, err := service.Start(context.Background(), client, Request{Model: "terra", CanonicalInput: "hello"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for event := range events {
-			if event.Type == EventRunCompleted && len(event.Billing.QuotaObservations) != test.want {
-				t.Fatalf("include=%t quota=%#v", test.include, event.Billing.QuotaObservations)
-			}
-		}
 	}
 }
 

@@ -53,8 +53,14 @@ h3 { margin-bottom: 0; font-size: 15px; }
 .button.primary:hover { background: var(--accent-hover); }
 .button.danger { color: var(--red); }
 .content { padding: 28px 32px 48px; }
-.notice { margin: 16px 32px -4px; padding: 10px 13px; border: 1px solid #b9ddc9; border-radius: 8px; color: #205c40; background: #edf8f2; font-size: 12px; }
-.notice.error { border-color: #ecc7c7; color: #8b3030; background: var(--red-soft); }
+.toast { position: fixed; inset: auto auto 24px 50%; z-index: 3000; width: max-content; min-width: 280px; max-width: min(560px, calc(100vw - 32px)); margin: 0; padding: 11px 10px 11px 13px; display: grid; grid-template-columns: 8px minmax(0, 1fr) 28px; gap: 10px; align-items: center; overflow: hidden; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; color: #f5faf7; background: #1c2c25; box-shadow: 0 16px 42px rgba(15,30,23,.28); opacity: 0; transform: translate(-50%, 12px); transition: opacity .18s ease, transform .18s ease; }
+.toast.visible { opacity: 1; transform: translate(-50%, 0); }
+.toast.error { background: #652f2f; }
+.toast-mark { width: 8px; height: 8px; border-radius: 50%; background: #6fd69c; box-shadow: 0 0 0 4px rgba(111,214,156,.13); }
+.toast.error .toast-mark { background: #ff9696; box-shadow: 0 0 0 4px rgba(255,150,150,.13); }
+.toast-message { min-width: 0; max-height: 92px; overflow: auto; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.toast-close { width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; color: #b8c7bf; background: transparent; font-size: 17px; line-height: 1; }
+.toast-close:hover { color: #fff; background: rgba(255,255,255,.08); }
 .loading { min-height: 300px; display: grid; place-content: center; justify-items: center; color: var(--muted); }
 .loading span { width: 22px; height: 22px; border: 2px solid #d8e2dc; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 .loading p { margin: 10px 0 0; font-size: 11px; }
@@ -91,7 +97,6 @@ td { padding: 11px 12px; border-top: 1px solid #e8ece9; vertical-align: middle; 
 td code { color: #37624d; font-size: 10px; }
 td small { display: block; margin-top: 4px; color: #8a948f; font-size: 9px; }
 .empty-state { padding: 42px 20px; color: var(--muted); text-align: center; font-size: 12px; }
-.error-text { color: var(--red); }
 .muted { color: var(--muted); }
 dialog { width: min(780px, calc(100vw - 70px)); padding: 0; border: 0; border-radius: 12px; box-shadow: var(--shadow); }
 dialog.wide-dialog { width: min(1320px, calc(100vw - 50px)); }
@@ -166,4 +171,7 @@ dialog::backdrop { background: rgba(12,25,19,.47); backdrop-filter: blur(3px); }
   .provider-grid, .usage-summary-grid { grid-template-columns: 1fr 1fr; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .usage-toolbar { align-items: flex-start; flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast { transition: none; }
 }

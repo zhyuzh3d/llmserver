@@ -13,7 +13,6 @@ clients:
         - codex-terra
         - codex-sol
         - workbuddy-hy4-preview
-      include_quota_observations: false
 providers:
     - id: api-openai
       type: openai_responses
@@ -33,7 +32,9 @@ providers:
       display_name: Codex
       executable: /Applications/ChatGPT.app/Contents/Resources/codex
       expected_version: codex-cli 0.151.
-      observe_quota: true
+      max_concurrency: 2
+      default_reasoning_effort: low
+      service_tier: priority
       default_public_price:
         revision: codex-local-default-1788155856746
         currency: USD
@@ -44,7 +45,12 @@ providers:
       type: workbuddy_exec
       display_name: WorkBuddy
       executable: /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy
-      expected_version: 2.115.
+      expected_version: 2.132.
+      max_concurrency: 2
+      default_reasoning_effort: high
+      warmup_enabled: true
+      warmup_model: hy4-preview
+      warmup_timeout_seconds: 30
       default_public_price:
         revision: workbuddy-local-default-1788155868655
         currency: USD
@@ -181,12 +187,7 @@ deployments:
       provider_id: workbuddy-local
       upstream_model: hy4-preview
       supported_reasoning_efforts:
-        - minimal
-        - low
-        - medium
         - high
-        - xhigh
-        - max
       price:
         revision: workbuddy-hy4-preview-public-v1
         currency: USD

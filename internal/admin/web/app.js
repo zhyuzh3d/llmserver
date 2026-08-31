@@ -15,7 +15,8 @@ const state = {
 
 const content = document.querySelector("#content");
 const pageTitle = document.querySelector("#page-title");
-const notice = document.querySelector("#notice");
+const toast = document.querySelector("#toast");
+const toastMessage = document.querySelector("#toast-message");
 const modelDialog = document.querySelector("#model-dialog");
 const providerDialog = document.querySelector("#provider-dialog");
 
@@ -48,18 +49,33 @@ const compactDecimal = (value, digits) => fixedDecimal(value, digits).replace(/\
 function normalizedPrice(value, label) {
   const number = Number(value);
   if (!Number.isFinite(number) || number < 0) {
-    showNotice(`${label}必须是非负数字。`, true);
+    showToast(`${label}必须是非负数字。`, true);
     return null;
   }
   return number.toFixed(2);
 }
 
-function showNotice(message, error = false) {
-  notice.textContent = message;
-  notice.className = `notice${error ? " error" : ""}`;
-  notice.hidden = false;
-  clearTimeout(showNotice.timer);
-  showNotice.timer = setTimeout(() => notice.hidden = true, 4800);
+function hideToast() {
+  clearTimeout(showToast.timer);
+  clearTimeout(showToast.hideTimer);
+  toast.classList.remove("visible");
+  toast.setAttribute("aria-hidden", "true");
+  showToast.hideTimer = setTimeout(() => {
+    if (typeof toast.hidePopover === "function" && toast.matches(":popover-open")) toast.hidePopover();
+  }, 180);
+}
+
+function showToast(message, error = false) {
+  clearTimeout(showToast.timer);
+  clearTimeout(showToast.hideTimer);
+  toastMessage.textContent = message;
+  toast.className = `toast${error ? " error" : ""}`;
+  toast.setAttribute("role", error ? "alert" : "status");
+  toast.setAttribute("aria-live", error ? "assertive" : "polite");
+  toast.setAttribute("aria-hidden", "false");
+  if (typeof toast.showPopover === "function" && !toast.matches(":popover-open")) toast.showPopover();
+  requestAnimationFrame(() => toast.classList.add("visible"));
+  showToast.timer = setTimeout(hideToast, error ? 7000 : 4200);
 }
 
 function markDirty() {
@@ -94,10 +110,10 @@ async function saveAll() {
       }),
     });
     await loadState();
-    showNotice("配置已保存，新请求已使用新配置。")
+    showToast("配置已保存，新请求已使用新配置。")
     return true;
   } catch (error) {
-    showNotice(error.message, true);
+    showToast(error.message, true);
     return false;
   } finally {
     button.disabled = false;
@@ -127,7 +143,7 @@ function renderOverview() {
     <div class="metric-grid">
       <article class="metric"><span>供应商</span><strong>${state.config.providers.length}</strong><small>${apiProviders.length} 个 API · ${state.config.providers.length - apiProviders.length} 个系统</small></article>
       <article class="metric"><span>启用模型</span><strong>${enabled.length}</strong><small>共配置 ${state.config.deployments.length} 个模型</small></article>
-      <article class="metric"><span>访问密钥</span><strong>${state.config.clients.length}</strong><small>独立模型权限与额度策略</small></article>
+      <article class="metric"><span>访问密钥</span><strong>${state.config.clients.length}</strong><small>独立模型访问权限</small></article>
       <article class="metric"><span>连接状态</span><strong>${missingKeys ? "待配置" : "正常"}</strong><small>${missingKeys ? `${missingKeys} 个 API 缺少 Key` : state.config.server.listen}</small></article>
     </div>
     <div class="section-head"><div><h2>供应商与模型</h2><p>刷新目录后可在同一窗口启停模型、修改公开价格和后台实际消耗口径。</p></div><button class="button" data-go="providers">管理供应商</button></div>
@@ -236,14 +252,20 @@ function systemProviderFields(provider) {
     <div class="form-section"><h3>本机程序</h3><p>版本前缀不匹配时供应商会拒绝接单，避免静默协议漂移。</p></div>
     <label class="field full"><span>可执行程序</span><input data-provider-field="executable" value="${escapeHTML(provider.executable || "")}"></label>
     <label class="field"><span>版本前缀</span><input data-provider-field="expected_version" value="${escapeHTML(provider.expected_version || "")}"></label>
-    ${provider.type === "codex_exec" ? `<label class="check-field"><input type="checkbox" data-provider-field="observe_quota" ${provider.observe_quota ? "checked" : ""}><span>记录 Codex 额度窗口</span></label>` : ""}`;
+    <label class="field"><span>最大并发</span><input type="number" min="1" max="16" data-provider-field="max_concurrency" value="${Number(provider.max_concurrency) || 2}"></label>
+    <label class="field"><span>默认推理强度</span><select data-provider-field="default_reasoning_effort"><option value="" ${provider.default_reasoning_effort ? "" : "selected"}>由上游决定</option>${["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map(value => `<option value="${value}" ${provider.default_reasoning_effort === value ? "selected" : ""}>${value}</option>`).join("")}</select></label>
+    ${provider.type === "codex_exec" ? `<label class="field"><span>速度层级</span><select data-provider-field="service_tier"><option value="" ${provider.service_tier ? "" : "selected"}>标准</option><option value="priority" ${provider.service_tier === "priority" ? "selected" : ""}>Fast（额外额度）</option></select></label>` : ""}
+    ${provider.type === "workbuddy_exec" ? `<div class="form-section"><h3>常驻与预热</h3><p>启动及 worker 异常恢复时，用最短真实生成预热每个常驻槽位；会消耗少量积分。</p></div>
+      <label class="field"><span>自动预热</span><input type="checkbox" data-provider-field="warmup_enabled" ${provider.warmup_enabled ? "checked" : ""}></label>
+      <label class="field"><span>预热模型</span><input data-provider-field="warmup_model" value="${escapeHTML(provider.warmup_model || "hy4-preview")}"></label>
+      <label class="field"><span>预热超时（秒）</span><input type="number" min="5" max="300" data-provider-field="warmup_timeout_seconds" value="${Number(provider.warmup_timeout_seconds) || 30}"></label>` : ""}`;
 }
 
 async function applyProvider() {
   const draft = state.providerDraft;
   const provider = draft.provider;
   document.querySelectorAll("[data-provider-field]").forEach(input => {
-    provider[input.dataset.providerField] = input.type === "checkbox" ? input.checked : input.value.trim();
+    provider[input.dataset.providerField] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value.trim();
   });
   provider.default_public_price ||= {};
   document.querySelectorAll("[data-default-field]").forEach(input => provider.default_public_price[input.dataset.defaultField] = input.value.trim());
@@ -255,7 +277,7 @@ async function applyProvider() {
   provider.default_public_price.revision = `${provider.id}-default-${Date.now()}`;
   provider.default_public_price.source = "configured";
   if (!provider.id || byID(state.config.providers.filter((_, index) => index !== draft.index), provider.id)) {
-    return showNotice("供应商 ID 为空或重复。", true);
+    return showToast("供应商 ID 为空或重复。", true);
   }
   if (draft.isNew) state.config.providers.push(provider); else state.config.providers[draft.index] = provider;
   const key = document.querySelector("#provider-key-update")?.value.trim();
@@ -294,7 +316,7 @@ async function discoverModels(providerID, button) {
     }
     state.modelProviderID = providerID;
     renderModelDialog(provider);
-  } catch (error) { showNotice(error.message, true); }
+  } catch (error) { showToast(error.message, true); }
   finally { if (button) { button.disabled = false; button.textContent = oldText; } }
 }
 
@@ -321,7 +343,7 @@ function modelDialogRow(row, index, defaults, provider) {
     <td><input class="compact actual-input" value="${fixedDecimal(actual.input_per_million, 2)}"></td>
     <td><input class="compact actual-output" value="${fixedDecimal(actual.output_per_million, 2)}"></td>`;
   if (provider.type === "codex_exec") {
-    actualFields = `<td><select class="compact actual-kind" disabled><option value="quota">周额度百分比</option></select></td><td><input class="compact actual-unit" value="%" disabled></td><td><input class="compact actual-input" value="自动观测" disabled></td><td><input class="compact actual-output" value="自动观测" disabled></td>`;
+    actualFields = `<td><select class="compact actual-kind" disabled><option value="none">不记录</option></select></td><td><input class="compact actual-unit" value="" disabled></td><td><input class="compact actual-input" value="" disabled></td><td><input class="compact actual-output" value="" disabled></td>`;
   } else if (provider.type === "workbuddy_exec") {
     actualFields = `<td><select class="compact actual-kind" disabled><option value="reported_points">积分实报</option></select></td><td><input class="compact actual-unit" value="POINTS" disabled></td><td><input class="compact actual-input" value="实际值" disabled></td><td><input class="compact actual-output" value="实际值" disabled></td>`;
   }
@@ -358,7 +380,7 @@ async function applyModels() {
     const enabled = element.querySelector(".model-enabled").checked;
     if (!row.deployment && !enabled) continue;
     const id = element.querySelector(".public-id").value.trim();
-    if (!id) return showNotice("公开模型 ID 不能为空。", true);
+    if (!id) return showToast("公开模型 ID 不能为空。", true);
     const publicInput = normalizedPrice(element.querySelector(".public-input").value.trim(), `${id} 平台输入价格`);
     const publicOutput = normalizedPrice(element.querySelector(".public-output").value.trim(), `${id} 平台输出价格`);
     if (publicInput === null || publicOutput === null) return;
@@ -390,7 +412,7 @@ async function applyModels() {
   }
   const finalIDs = new Set(state.config.deployments.filter(item => item.provider_id !== provider.id).map(item => item.id));
   for (const item of proposed) {
-    if (finalIDs.has(item.deployment.id)) return showNotice(`公开模型 ID ${item.deployment.id} 重复。`, true);
+    if (finalIDs.has(item.deployment.id)) return showToast(`公开模型 ID ${item.deployment.id} 重复。`, true);
     finalIDs.add(item.deployment.id);
   }
   const oldToNew = new Map();
@@ -409,7 +431,7 @@ async function applyModels() {
 
 function renderAccess() {
   content.innerHTML = `
-    <div class="section-head first"><div><h2>访问密钥</h2><p>每个密钥独立控制模型权限和是否允许返回订阅额度信息。</p></div><button class="button primary" id="add-client">生成新密钥</button></div>
+    <div class="section-head first"><div><h2>访问密钥</h2><p>每个密钥独立控制可访问的模型。</p></div><button class="button primary" id="add-client">生成新密钥</button></div>
     <div class="key-list">${state.config.clients.map((client, index) => accessKeyCard(client, index)).join("") || `<div class="empty-state">还没有访问密钥</div>`}</div>`;
   bindAccessEditors();
   document.querySelector("#add-client").addEventListener("click", addClient);
@@ -420,7 +442,6 @@ function accessKeyCard(client, index) {
     <div class="key-summary"><div><span class="category">ACCESS KEY</span><h3 title="${escapeHTML(client.id)}">${escapeHTML(client.id)}</h3><code title="${escapeHTML(secretHint("client", client.id) || "未配置")}">${escapeHTML(secretHint("client", client.id) || "未配置")}</code></div><div class="key-actions"><button class="button copy-client">复制</button><button class="button regenerate-client">重新生成</button><button class="button danger remove-client">删除</button></div></div>
     <details><summary>权限设置 <span>${client.allowed_deployments.length} 个模型</span></summary><div class="key-settings">
       <label class="field"><span>密钥名称</span><input class="client-name" value="${escapeHTML(client.id)}"></label>
-      <label class="check-field"><input type="checkbox" class="quota-toggle" ${client.include_quota_observations ? "checked" : ""}><span>允许响应返回订阅额度观测</span></label>
       <div class="permission-grid">${state.config.deployments.map(model => `<label><input type="checkbox" value="${escapeHTML(model.id)}" ${client.allowed_deployments.includes(model.id) ? "checked" : ""}>${escapeHTML(model.id)}</label>`).join("")}</div>
     </div></details>
   </article>`;
@@ -446,7 +467,6 @@ function bindAccessEditors() {
       }
       markDirty(); renderAccess();
     });
-    card.querySelector(".quota-toggle").addEventListener("change", event => { client.include_quota_observations = event.target.checked; markDirty(); });
     card.querySelectorAll(".permission-grid input").forEach(input => input.addEventListener("change", () => {
       client.allowed_deployments = [...card.querySelectorAll(".permission-grid input:checked")].map(item => item.value);
       markDirty();
@@ -460,14 +480,14 @@ async function addClient() {
   const id = `access-${suffix}`;
   try {
     const result = await api("/admin/api/tokens/generate", { method: "POST", body: "{}" });
-    state.config.clients.push({ id, allowed_deployments: [], include_quota_observations: false });
+    state.config.clients.push({ id, allowed_deployments: [] });
     state.secretUpdates.clients[id] = result.token;
     markDirty();
     if (await saveAll()) {
       await copyText(result.token);
-      showNotice("新密钥已生成并复制；请继续设置模型权限。")
+      showToast("新密钥已生成并复制；请继续设置模型权限。")
     }
-  } catch (error) { showNotice(error.message, true); }
+  } catch (error) { showToast(error.message, true); }
 }
 
 async function regenerateClient(client) {
@@ -478,19 +498,19 @@ async function regenerateClient(client) {
     markDirty();
     if (await saveAll()) {
       await copyText(result.token);
-      showNotice("新密钥已保存并复制，旧密钥已经失效。")
+      showToast("新密钥已保存并复制，旧密钥已经失效。")
     }
-  } catch (error) { showNotice(error.message, true); }
+  } catch (error) { showToast(error.message, true); }
 }
 
 async function copySecret(kind, id) {
   try {
     if (!state.secrets) state.secrets = await api("/admin/api/secrets");
     const value = kind === "provider" ? state.secrets.provider_api_keys?.[id] : state.secrets.client_tokens?.[id];
-    if (!value) return showNotice("当前没有已保存的密钥。", true);
+    if (!value) return showToast("当前没有已保存的密钥。", true);
     await copyText(value);
-    showNotice(kind === "provider" ? "API Key 已复制。" : "访问密钥已复制。")
-  } catch (error) { showNotice(error.message, true); }
+    showToast(kind === "provider" ? "API Key 已复制。" : "访问密钥已复制。")
+  } catch (error) { showToast(error.message, true); }
 }
 
 async function copyText(value) {
@@ -514,8 +534,9 @@ async function renderUsage(groupBy) {
     content.innerHTML = `${usageToolbar(groupBy, selectorValue)}${usageReport(groupBy, report, selectorValue)}`;
     bindUsageControls(groupBy);
   } catch (error) {
-    content.innerHTML = `${usageToolbar(groupBy, selectorValue)}<div class="empty-state error-text">${escapeHTML(error.message)}</div>`;
+    content.innerHTML = usageToolbar(groupBy, selectorValue);
     bindUsageControls(groupBy);
+    showToast(error.message, true);
   }
 }
 
@@ -555,7 +576,7 @@ function usageReport(groupBy, report, selected) {
   const configured = groupBy === "provider" ? state.config.providers : state.config.clients;
   const visible = selected ? configured.filter(item => item.id === selected) : configured;
   const reportByID = new Map((report.groups || []).map(group => [group.id, group]));
-  const groups = visible.map(item => reportByID.get(item.id) || { id: item.id, runs: 0, input_tokens: 0, output_tokens: 0, public_totals: [], actual_totals: [], quota_totals: [], models: [] });
+  const groups = visible.map(item => reportByID.get(item.id) || { id: item.id, runs: 0, input_tokens: 0, output_tokens: 0, public_totals: [], actual_totals: [], models: [] });
   const rows = groups.flatMap(group => (group.models || []).map(model => ({ ...model, group_id: group.id })));
   return `
     <div class="usage-summary-grid">${groups.map(group => usageSummaryCard(groupBy, group)).join("") || `<div class="empty-state">当前没有可统计对象</div>`}</div>
@@ -565,12 +586,12 @@ function usageReport(groupBy, report, selected) {
 
 function usageSummaryCard(groupBy, group) {
   const title = groupBy === "provider" ? providerName(group.id) : group.id;
-  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3 title="${escapeHTML(title)}">${escapeHTML(title)}</h3></div><strong title="${group.runs} 次请求">${group.runs}</strong></header><div class="usage-kpis"><div><span>平台消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际消耗</span><b>${formatActual(group.actual_totals, group.quota_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 入 · ${Number(group.output_tokens).toLocaleString()} 出</footer></article>`;
+  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3 title="${escapeHTML(title)}">${escapeHTML(title)}</h3></div><strong title="${group.runs} 次请求">${group.runs}</strong></header><div class="usage-kpis"><div><span>平台消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际消耗</span><b>${formatActual(group.actual_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 入 · ${Number(group.output_tokens).toLocaleString()} 出</footer></article>`;
 }
 
 function usageModelsTable(groupBy, rows) {
   if (!rows.length) return `<div class="empty-state">所选时间范围内没有消耗</div>`;
-  return `<div class="table-card"><table><thead><tr>${groupBy === "client" ? "<th>访问密钥</th>" : ""}<th>模型</th><th>供应商</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>平台价消耗</th><th>实际供应商消耗</th></tr></thead><tbody>${rows.map(row => `<tr>${groupBy === "client" ? `<td><code>${escapeHTML(row.group_id)}</code></td>` : ""}<td><strong>${escapeHTML(row.deployment_id)}</strong></td><td>${escapeHTML(providerName(row.provider_id))}</td><td>${row.runs}</td><td>${Number(row.input_tokens).toLocaleString()}</td><td>${Number(row.output_tokens).toLocaleString()}</td><td>${formatUnitTotals(row.public_totals)}</td><td>${formatActual(row.actual_totals, row.quota_totals, false, row.provider_id)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-card"><table><thead><tr>${groupBy === "client" ? "<th>访问密钥</th>" : ""}<th>模型</th><th>供应商</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>平台价消耗</th><th>实际供应商消耗</th></tr></thead><tbody>${rows.map(row => `<tr>${groupBy === "client" ? `<td><code>${escapeHTML(row.group_id)}</code></td>` : ""}<td><strong>${escapeHTML(row.deployment_id)}</strong></td><td>${escapeHTML(providerName(row.provider_id))}</td><td>${row.runs}</td><td>${Number(row.input_tokens).toLocaleString()}</td><td>${Number(row.output_tokens).toLocaleString()}</td><td>${formatUnitTotals(row.public_totals)}</td><td>${formatActual(row.actual_totals, false, row.provider_id)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function formatUnitTotals(items = []) {
@@ -582,25 +603,15 @@ function amountChip(text, className = "", badge = "", title = text) {
   return `<span class="amount ${className}" title="${escapeHTML(title)}"><span class="amount-main">${escapeHTML(text)}</span>${badge ? `<small>${escapeHTML(badge)}</small>` : ""}</span>`;
 }
 
-function formatActual(actual = [], quota = [], showProvider = false, fixedProviderID = "") {
-  const providerIDs = new Set([fixedProviderID, ...actual.map(item => item.provider_id), ...quota.map(item => item.provider_id)].filter(Boolean));
+function formatActual(actual = [], showProvider = false, fixedProviderID = "") {
+  const providerIDs = new Set([fixedProviderID, ...actual.map(item => item.provider_id)].filter(Boolean));
   const values = [];
   for (const providerID of providerIDs) {
     const provider = byID(state.config.providers, providerID);
     const shortProvider = usageProviderName(providerID);
     const prefix = showProvider ? `${shortProvider} · ` : "";
     const providerActual = actual.filter(item => item.provider_id === providerID);
-    const providerQuota = quota.filter(item => item.provider_id === providerID);
     if (provider?.type === "codex_exec") {
-      const weekly = providerQuota.filter(item => item.status === "observed" && Number(item.window_duration_minutes) >= 6 * 24 * 60 && Number(item.window_duration_minutes) <= 8 * 24 * 60);
-      const selected = weekly.find(item => item.limit_id === "codex:primary") || weekly.sort((a, b) => Number(b.latest_after || 0) - Number(a.latest_after || 0))[0];
-      if (selected) {
-        const delta = Number(selected.delta || 0);
-        const deltaText = `${delta > 0 ? "+" : ""}${compactDecimal(delta, 2)}%`;
-        values.push(amountChip(`${prefix}周 ${compactDecimal(selected.latest_after || 0, 2)}%`, "quota", deltaText, `${providerName(providerID)}：周额度已用 ${fixedDecimal(selected.latest_after || 0, 2)}%，所选时段变化 ${deltaText}`));
-      } else if (providerQuota.length) {
-        values.push(amountChip(`${prefix}周额度不可比`, "quota unavailable", "", `${providerName(providerID)}：周额度窗口暂不可比较`));
-      }
       continue;
     }
     if (provider?.type === "workbuddy_exec") {
@@ -638,4 +649,5 @@ providerDialog.addEventListener("click", event => {
   if (event.target.classList.contains("copy-dialog-secret")) copySecret("provider", state.providerDraft.provider.id);
 });
 window.addEventListener("beforeunload", event => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
-loadState().catch(error => { content.innerHTML = `<div class="empty-state error-text">${escapeHTML(error.message)}</div>`; showNotice(error.message, true); });
+document.querySelector("#toast-close").addEventListener("click", hideToast);
+loadState().catch(error => { content.replaceChildren(); showToast(error.message, true); });

@@ -10,10 +10,9 @@ import (
 )
 
 type Client struct {
-	ID                       string
-	AllowedDeployments       map[string]struct{}
-	IncludeQuotaObservations bool
-	tokenHash                [sha256.Size]byte
+	ID                 string
+	AllowedDeployments map[string]struct{}
+	tokenHash          [sha256.Size]byte
 }
 
 func (c *Client) Allows(deploymentID string) bool {
@@ -29,21 +28,20 @@ func FromConfig(clients []config.ClientConfig) (*Authenticator, error) {
 	result := &Authenticator{}
 	for _, clientConfig := range clients {
 		token := clientConfig.Token.Reveal()
-		result.clients = append(result.clients, NewClient(clientConfig.ID, token, clientConfig.AllowedDeployments, clientConfig.IncludeQuotaObservations))
+		result.clients = append(result.clients, NewClient(clientConfig.ID, token, clientConfig.AllowedDeployments))
 	}
 	return result, nil
 }
 
-func NewClient(id, token string, allowedDeployments []string, includeQuota bool) *Client {
+func NewClient(id, token string, allowedDeployments []string) *Client {
 	allowed := make(map[string]struct{}, len(allowedDeployments))
 	for _, deploymentID := range allowedDeployments {
 		allowed[deploymentID] = struct{}{}
 	}
 	return &Client{
-		ID:                       id,
-		AllowedDeployments:       allowed,
-		IncludeQuotaObservations: includeQuota,
-		tokenHash:                sha256.Sum256([]byte(token)),
+		ID:                 id,
+		AllowedDeployments: allowed,
+		tokenHash:          sha256.Sum256([]byte(token)),
 	}
 }
 

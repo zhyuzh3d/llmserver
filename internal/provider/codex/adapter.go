@@ -2,16 +2,21 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,23 +25,38 @@ import (
 )
 
 const maxEventBytes = 8 << 20
-
-// The desktop app-server may need several seconds to refresh account limits.
-// Keep this separate from generation timeouts: quota is observational and a
-// slow refresh must never invalidate an otherwise completed settlement.
-const quotaReadTimeout = 25 * time.Second
+const maxDirectErrorBody = 64 << 10
+const directEndpoint = "https://chatgpt.com/backend-api/codex/responses"
 
 type Config struct {
-	ProviderID      string
-	Executable      string
-	ExpectedVersion string
-	ExtraArgs       []string
-	ObserveQuota    bool
+	ProviderID       string
+	Executable       string
+	ExpectedVersion  string
+	ExtraArgs        []string
+	MaxConcurrency   int
+	DefaultReasoning string
+	ServiceTier      string
+	// DisableDirect is used by deterministic adapter tests. Production keeps
+	// the low-overhead Responses transport enabled.
+	DisableDirect  bool
+	DirectEndpoint string
+	DirectClient   *http.Client
 }
 
+// Adapter keeps a small pool of initialized App Server processes. Each worker
+// handles only one ephemeral thread at a time, so requests never share history,
+// while process startup, authentication and transport connections stay warm.
 type Adapter struct {
-	config Config
-	slot   chan struct{}
+	config             Config
+	slot               chan struct{}
+	mu                 sync.Mutex
+	idle               []*appServerWorker
+	retired            bool
+	direct             *http.Client
+	directEndpoint     string
+	authMu             sync.Mutex
+	auth               cachedAuth
+	directBlockedUntil atomic.Int64
 }
 
 func New(config Config) (*Adapter, error) {
@@ -51,7 +71,23 @@ func New(config Config) (*Adapter, error) {
 	if config.ExpectedVersion != "" && !strings.HasPrefix(version, config.ExpectedVersion) {
 		return nil, fmt.Errorf("Codex version %q does not match expected prefix %q", version, config.ExpectedVersion)
 	}
-	return &Adapter{config: config, slot: make(chan struct{}, 1)}, nil
+	if config.MaxConcurrency == 0 {
+		config.MaxConcurrency = 2
+	}
+	endpoint := config.DirectEndpoint
+	if endpoint == "" {
+		endpoint = directEndpoint
+	}
+	client := config.DirectClient
+	if client == nil {
+		client = newDirectHTTPClient()
+	}
+	return &Adapter{
+		config:         config,
+		slot:           make(chan struct{}, config.MaxConcurrency),
+		direct:         client,
+		directEndpoint: endpoint,
+	}, nil
 }
 
 func (a *Adapter) ID() string { return a.config.ProviderID }
@@ -62,37 +98,378 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	if !a.config.DisableDirect && time.Now().UnixNano() >= a.directBlockedUntil.Load() {
+		response, fallback, directErr := a.startDirect(ctx, request)
+		if directErr == nil {
+			events := make(chan provider.Event)
+			go func() {
+				defer close(events)
+				defer func() { <-a.slot }()
+				defer response.Body.Close()
+				consumeDirectStream(ctx, response.Body, request.UpstreamModel, events)
+			}()
+			return events, nil
+		}
+		if !fallback {
+			slog.Warn("Codex direct Responses request failed", "provider", a.config.ProviderID, "error", directErr)
+			<-a.slot
+			return nil, directErr
+		}
+		slog.Info("Codex direct Responses route unavailable; using App Server fallback", "provider", a.config.ProviderID, "error", directErr)
+	}
 
-	runDir, err := os.MkdirTemp("", "llmserver-codex-run-")
+	worker, err := a.acquireWorker()
 	if err != nil {
+		slog.Warn("Codex App Server fallback failed", "provider", a.config.ProviderID, "error", err)
 		<-a.slot
-		return nil, fmt.Errorf("create Codex run directory: %w", err)
+		return nil, err
 	}
-	prompt := buildPrompt(request)
-	quotaBefore := map[string]quotaWindow{}
-	if a.config.ObserveQuota {
-		quotaCtx, quotaCancel := context.WithTimeout(ctx, quotaReadTimeout)
-		quotaBefore, _ = readRateLimits(quotaCtx, a.config)
-		quotaCancel()
+	events := make(chan provider.Event)
+	go func() {
+		defer close(events)
+		defer func() { <-a.slot }()
+		reusable := worker.run(ctx, a.config, request, events)
+		a.releaseWorker(worker, reusable)
+	}()
+	return events, nil
+}
+
+// Retire stops accepting new work and closes idle workers. An in-flight worker
+// finishes its current request, then closes instead of returning to the pool.
+func (a *Adapter) Retire() {
+	a.mu.Lock()
+	a.retired = true
+	idle := a.idle
+	a.idle = nil
+	a.mu.Unlock()
+	for _, worker := range idle {
+		worker.close()
 	}
-	args := append([]string{}, a.config.ExtraArgs...)
+	if a.direct != nil {
+		a.direct.CloseIdleConnections()
+	}
+}
+
+func (a *Adapter) acquireWorker() (*appServerWorker, error) {
+	a.mu.Lock()
+	if a.retired {
+		a.mu.Unlock()
+		return nil, errors.New("Codex adapter is retired")
+	}
+	for len(a.idle) > 0 {
+		last := len(a.idle) - 1
+		worker := a.idle[last]
+		a.idle = a.idle[:last]
+		if !worker.closed.Load() {
+			a.mu.Unlock()
+			return worker, nil
+		}
+	}
+	a.mu.Unlock()
+	return newAppServerWorker(a.config)
+}
+
+func (a *Adapter) releaseWorker(worker *appServerWorker, reusable bool) {
+	if worker == nil {
+		return
+	}
+	a.mu.Lock()
+	if reusable && !a.retired && !worker.closed.Load() {
+		a.idle = append(a.idle, worker)
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	worker.close()
+}
+
+type cachedAuth struct {
+	modTime   time.Time
+	access    string
+	accountID string
+}
+
+func (a *Adapter) startDirect(ctx context.Context, request provider.Request) (*http.Response, bool, error) {
+	auth, err := a.loadAuth()
+	if err != nil {
+		a.directBlockedUntil.Store(time.Now().Add(time.Minute).UnixNano())
+		return nil, true, err
+	}
+	effort := request.ReasoningEffort
+	if effort == "" {
+		effort = a.config.DefaultReasoning
+	}
+	body := map[string]any{
+		"model":               request.UpstreamModel,
+		"instructions":        modelOnlyInstructions,
+		"input":               []map[string]any{{"role": "user", "content": []map[string]string{{"type": "input_text", "text": request.CanonicalInput}}}},
+		"tools":               []any{},
+		"tool_choice":         "auto",
+		"parallel_tool_calls": false,
+		"store":               false,
+		"stream":              true,
+		"include":             []string{},
+		"prompt_cache_key":    "llmserver-codex-text-only-v2",
+	}
+	if effort != "" {
+		body["reasoning"] = map[string]string{"effort": effort}
+	}
+	if a.config.ServiceTier != "" {
+		body["service_tier"] = a.config.ServiceTier
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, false, err
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, a.directEndpoint, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, false, fmt.Errorf("create Codex Responses request: %w", err)
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+auth.access)
+	httpRequest.Header.Set("ChatGPT-Account-ID", auth.accountID)
+	httpRequest.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("User-Agent", "llmserver/0.3 codex-text-adapter")
+	response, err := a.direct.Do(httpRequest)
+	if err != nil {
+		// A transport error is ambiguous: the upstream may already have begun
+		// generating. Do not retry through App Server and risk duplicate usage.
+		return nil, false, fmt.Errorf("send Codex Responses request: %w", err)
+	}
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		return response, false, nil
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDirectErrorBody))
+	switch response.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		// Authentication refresh and backend contract drift are delegated to
+		// the official App Server fallback. Suppress repeated failed probes for
+		// a short interval while preserving automatic recovery.
+		a.directBlockedUntil.Store(time.Now().Add(time.Minute).UnixNano())
+		return nil, true, fmt.Errorf("Codex Responses returned HTTP %d", response.StatusCode)
+	default:
+		return nil, false, fmt.Errorf("Codex Responses returned HTTP %d", response.StatusCode)
+	}
+}
+
+func (a *Adapter) loadAuth() (cachedAuth, error) {
+	a.authMu.Lock()
+	defer a.authMu.Unlock()
+	path, err := codexAuthPath()
+	if err != nil {
+		return cachedAuth{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return cachedAuth{}, fmt.Errorf("stat current Codex credentials: %w", err)
+	}
+	if a.auth.access != "" && info.ModTime().Equal(a.auth.modTime) {
+		return a.auth, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return cachedAuth{}, fmt.Errorf("read current Codex credentials: %w", err)
+	}
+	var document struct {
+		Tokens struct {
+			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if json.Unmarshal(raw, &document) != nil || document.Tokens.AccessToken == "" || document.Tokens.AccountID == "" {
+		return cachedAuth{}, errors.New("current Codex credentials are incomplete")
+	}
+	a.auth = cachedAuth{modTime: info.ModTime(), access: document.Tokens.AccessToken, accountID: document.Tokens.AccountID}
+	return a.auth, nil
+}
+
+func codexAuthPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	codexHome := os.Getenv("CODEX_HOME")
+	if codexHome == "" {
+		codexHome = filepath.Join(home, ".codex")
+	}
+	return filepath.Join(codexHome, "auth.json"), nil
+}
+
+func newDirectHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 32
+	transport.MaxIdleConnsPerHost = 8
+	transport.IdleConnTimeout = 5 * time.Minute
+	if proxyURL := macOSSystemHTTPSProxy(); proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{Transport: transport}
+}
+
+func macOSSystemHTTPSProxy() *url.URL {
+	if _, err := os.Stat("/usr/sbin/scutil"); err != nil {
+		return nil
+	}
+	output, err := exec.Command("/usr/sbin/scutil", "--proxy").Output()
+	if err != nil {
+		return nil
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) == 2 {
+			values[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	if values["HTTPSEnable"] != "1" || values["HTTPSProxy"] == "" || values["HTTPSPort"] == "" {
+		return nil
+	}
+	proxyURL, err := url.Parse("http://" + values["HTTPSProxy"] + ":" + values["HTTPSPort"])
+	if err != nil {
+		return nil
+	}
+	return proxyURL
+}
+
+func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel string, events chan<- provider.Event) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
+	var dataLines []string
+	completed := false
+	flush := func() bool {
+		if len(dataLines) == 0 {
+			return true
+		}
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		if data == "[DONE]" {
+			return true
+		}
+		var event map[string]any
+		decoder := json.NewDecoder(strings.NewReader(data))
+		decoder.UseNumber()
+		if err := decoder.Decode(&event); err != nil {
+			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("decode Codex Responses event: %w", err)})
+			return false
+		}
+		eventType, _ := event["type"].(string)
+		switch eventType {
+		case "response.output_text.delta":
+			delta, _ := event["delta"].(string)
+			return delta == "" || send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: delta})
+		case "response.completed":
+			response, ok := event["response"].(map[string]any)
+			if !ok {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex completion has no response")})
+				return false
+			}
+			model, _ := response["model"].(string)
+			if model == "" {
+				model = requestedModel
+			}
+			usage, _ := response["usage"].(map[string]any)
+			inputTokens, inputPresent := directInteger(usage["input_tokens"])
+			outputTokens, outputPresent := directInteger(usage["output_tokens"])
+			final := &provider.Final{
+				EffectiveModel: model,
+				Usage: pricing.ReportedUsage{
+					InputTokens:  pricing.OptionalCount{Value: inputTokens, Present: inputPresent},
+					OutputTokens: pricing.OptionalCount{Value: outputTokens, Present: outputPresent},
+				},
+			}
+			completed = true
+			return send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: final})
+		case "error", "response.failed", "response.incomplete":
+			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("Codex Responses event %s", eventType)})
+			return false
+		default:
+			return true
+		}
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if !flush() || completed {
+				return
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if len(dataLines) > 0 && !completed {
+		if !flush() || completed {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("read Codex Responses stream: %w", err)})
+		return
+	}
+	if !completed {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex Responses stream ended before completion")})
+	}
+}
+
+func directInteger(value any) (int64, bool) {
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	parsed, err := number.Int64()
+	return parsed, err == nil && parsed >= 0
+}
+
+type appServerWorker struct {
+	command    *exec.Cmd
+	stdin      io.WriteCloser
+	encoder    *json.Encoder
+	scanner    *bufio.Scanner
+	runtimeDir string
+	nextID     int64
+	pending    []json.RawMessage
+	closed     atomic.Bool
+	closeOnce  sync.Once
+}
+
+func newAppServerWorker(config Config) (*appServerWorker, error) {
+	runtimeDir, err := os.MkdirTemp("", "llmserver-codex-worker-")
+	if err != nil {
+		return nil, fmt.Errorf("create Codex worker directory: %w", err)
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil {
+		os.RemoveAll(runtimeDir)
+		return nil, fmt.Errorf("secure Codex worker directory: %w", err)
+	}
+	codexHome := filepath.Join(runtimeDir, "home")
+	if err := os.Mkdir(codexHome, 0o700); err != nil {
+		os.RemoveAll(runtimeDir)
+		return nil, fmt.Errorf("create isolated Codex home: %w", err)
+	}
+	if err := copyCodexRuntimeFiles(codexHome); err != nil {
+		os.RemoveAll(runtimeDir)
+		return nil, err
+	}
+
+	args := append([]string{}, config.ExtraArgs...)
 	args = append(args,
-		"-a", "never",
-		"-s", "read-only",
-		"exec",
-		"--json",
-		"--ephemeral",
-		"--ignore-user-config",
-		"--ignore-rules",
-		"--skip-git-repo-check",
-		"-C", runDir,
-		"-m", request.UpstreamModel,
-		"-",
+		"--enable", "respect_system_proxy",
+		"--disable", "apps",
+		"--disable", "plugins",
+		"--disable", "hooks",
+		"--disable", "browser_use",
+		"--disable", "computer_use",
+		"--disable", "image_generation",
+		"--disable", "skill_search",
+		"app-server", "--stdio",
 	)
-	command := exec.CommandContext(ctx, a.config.Executable, args...)
-	command.Stdin = strings.NewReader(prompt)
+	command := exec.CommandContext(context.Background(), config.Executable, args...)
+	command.Dir = runtimeDir
 	command.Stderr = io.Discard
-	command.Env = minimalEnvironment()
+	command.Env = minimalEnvironment(codexHome)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 5 * time.Second
 	command.Cancel = func() error {
@@ -101,183 +478,263 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 		}
 		return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	}
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		os.RemoveAll(runtimeDir)
+		return nil, fmt.Errorf("open Codex stdin: %w", err)
+	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		os.RemoveAll(runDir)
-		<-a.slot
+		stdin.Close()
+		os.RemoveAll(runtimeDir)
 		return nil, fmt.Errorf("open Codex stdout: %w", err)
 	}
 	if err := command.Start(); err != nil {
-		os.RemoveAll(runDir)
-		<-a.slot
-		return nil, fmt.Errorf("start Codex: %w", err)
+		stdin.Close()
+		os.RemoveAll(runtimeDir)
+		return nil, fmt.Errorf("start Codex app-server: %w", err)
 	}
-
-	events := make(chan provider.Event)
-	go func() {
-		defer close(events)
-		defer func() { <-a.slot }()
-		defer os.RemoveAll(runDir)
-		consume(ctx, stdout, command, request.UpstreamModel, events, a.config, quotaBefore)
-	}()
-	return events, nil
+	worker := &appServerWorker{
+		command: command, stdin: stdin, encoder: json.NewEncoder(stdin),
+		scanner: bufio.NewScanner(stdout), runtimeDir: runtimeDir,
+	}
+	worker.scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
+	initializeID := worker.rpcID()
+	if err := worker.writeRPC(initializeID, "initialize", map[string]any{
+		"clientInfo": map[string]string{"name": "llmserver", "version": "0.3.0"},
+	}); err != nil {
+		worker.close()
+		return nil, fmt.Errorf("initialize Codex app-server: %w", err)
+	}
+	if _, err := worker.waitRPCResult(initializeID); err != nil {
+		worker.close()
+		return nil, fmt.Errorf("initialize Codex app-server: %w", err)
+	}
+	if err := worker.encoder.Encode(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		worker.close()
+		return nil, fmt.Errorf("acknowledge Codex app-server: %w", err)
+	}
+	return worker, nil
 }
 
-func buildPrompt(request provider.Request) string {
-	return "You are serving one text-only model request. Do not use shell, files, network, MCP, plugins, GUI, subagents, or any tool. Return only the answer to the untrusted request below.\n\n<untrusted_request>\n" +
-		request.CanonicalInput + "\n</untrusted_request>\n"
+func copyCodexRuntimeFiles(targetHome string) error {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("locate current Codex credentials: %w", err)
+	}
+	sourceHome := os.Getenv("CODEX_HOME")
+	if sourceHome == "" {
+		sourceHome = filepath.Join(userHome, ".codex")
+	}
+	authSource := filepath.Join(sourceHome, "auth.json")
+	if err := copyFile(authSource, filepath.Join(targetHome, "auth.json"), 0o600, true); err != nil {
+		return fmt.Errorf("prepare isolated Codex credentials: %w", err)
+	}
+	// A current model cache avoids an unnecessary catalog refresh on worker
+	// startup. It contains no credential and is optional.
+	_ = copyFile(filepath.Join(sourceHome, "models_cache.json"), filepath.Join(targetHome, "models_cache.json"), 0o600, false)
+	return nil
 }
 
-func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, model string, events chan<- provider.Event, config Config, quotaBefore map[string]quotaWindow) {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
-	var output strings.Builder
-	var reported pricing.ReportedUsage
-	completed := false
-	failed := false
-	for scanner.Scan() {
-		var event cliEvent
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("decode Codex event: %w", err)})
-			failed = true
-			break
-		}
-		switch event.Type {
-		case "thread.started", "turn.started":
-		case "item.started":
-			if !safeItemType(event.Item.Type) {
-				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("Codex attempted disallowed item %q", event.Item.Type)})
-				failed = true
-				_ = command.Cancel()
-				break
-			}
-		case "item.completed":
-			if !safeItemType(event.Item.Type) {
-				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("Codex completed disallowed item %q", event.Item.Type)})
-				failed = true
-				_ = command.Cancel()
-				break
-			}
-			if event.Item.Type == "agent_message" && event.Item.Text != "" {
-				output.WriteString(event.Item.Text)
-				if !send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: event.Item.Text}) {
-					failed = true
-					_ = command.Cancel()
-					break
-				}
-			}
-		case "turn.completed":
-			reported.InputTokens = pricing.OptionalCount{Value: event.Usage.InputTokens, Present: true}
-			reported.OutputTokens = pricing.OptionalCount{Value: event.Usage.OutputTokens, Present: true}
-			var quota []provider.QuotaObservation
-			if config.ObserveQuota {
-				quotaCtx, quotaCancel := context.WithTimeout(context.Background(), quotaReadTimeout)
-				quotaAfter, quotaErr := readRateLimits(quotaCtx, config)
-				quotaCancel()
-				if quotaErr == nil {
-					quota = compareQuota(quotaBefore, quotaAfter)
-				} else {
-					quota = []provider.QuotaObservation{{LimitID: "quota", Unit: "percent_used", Status: "unavailable", Attribution: "shared_account_window"}}
-				}
-			}
-			final := &provider.Final{OutputText: output.String(), EffectiveModel: model, Usage: reported, Quota: quota}
-			send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: final})
-			completed = true
-		default:
-			// Unknown top-level lifecycle events are ignored. Unknown item types are
-			// rejected above because those can represent local side effects.
-		}
-		if failed || completed {
-			break
-		}
-	}
-	waitErr := command.Wait()
-	if failed || completed || ctx.Err() != nil {
-		return
-	}
-	if err := scanner.Err(); err != nil {
-		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("read Codex events: %w", err)})
-		return
-	}
-	if waitErr != nil {
-		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("Codex exited before completion: %w", waitErr)})
-		return
-	}
-	send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex ended without turn completion")})
-}
-
-type quotaWindow struct {
-	UsedPercent           float64
-	WindowDurationMinutes int64
-	ResetsAt              int64
-}
-
-func readRateLimits(ctx context.Context, config Config) (map[string]quotaWindow, error) {
-	args := append([]string{}, config.ExtraArgs...)
-	args = append(args, "app-server", "--stdio")
-	command := exec.CommandContext(ctx, config.Executable, args...)
-	command.Env = minimalEnvironment()
-	command.Stderr = io.Discard
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	command.WaitDelay = 2 * time.Second
-	command.Cancel = func() error {
-		if command.Process == nil {
+func copyFile(source, target string, mode os.FileMode, required bool) error {
+	input, err := os.Open(source)
+	if err != nil {
+		if !required && errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		return err
 	}
-	stdin, err := command.StdinPipe()
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return nil, err
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
 	}
-	if err := command.Start(); err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = stdin.Close()
-		_ = command.Cancel()
-		_ = command.Wait()
-	}()
-	encoder := json.NewEncoder(stdin)
-	if err := encoder.Encode(map[string]any{
-		"id": 1, "method": "initialize",
-		"params": map[string]any{"clientInfo": map[string]string{"name": "llmserver", "version": "0.1.0"}},
-	}); err != nil {
-		return nil, err
-	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
-	if _, err := waitRPCResult(scanner, 1); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(map[string]any{"id": 2, "method": "account/rateLimits/read", "params": map[string]any{}}); err != nil {
-		return nil, err
-	}
-	result, err := waitRPCResult(scanner, 2)
-	if err != nil {
-		return nil, err
-	}
-	return decodeRateLimits(result)
+	return closeErr
 }
 
-func waitRPCResult(scanner *bufio.Scanner, wantedID int64) (json.RawMessage, error) {
-	for scanner.Scan() {
+const modelOnlyInstructions = "You are serving one text-only model request. Never use shell, files, network, MCP, plugins, GUI, subagents, or any tool. Return only the answer requested by the user."
+
+func (w *appServerWorker) run(ctx context.Context, config Config, request provider.Request, events chan<- provider.Event) bool {
+	runDir, err := os.MkdirTemp(w.runtimeDir, "run-")
+	if err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("create Codex run directory: %w", err)})
+		return false
+	}
+	defer os.RemoveAll(runDir)
+	watchDone := make(chan struct{})
+	var stopWatch sync.Once
+	stopCancellationWatch := func() { stopWatch.Do(func() { close(watchDone) }) }
+	defer stopCancellationWatch()
+	go func() {
+		select {
+		case <-ctx.Done():
+			w.close()
+		case <-watchDone:
+		}
+	}()
+
+	threadRPCID := w.rpcID()
+	if err := w.writeRPC(threadRPCID, "thread/start", map[string]any{
+		"approvalPolicy":   "never",
+		"baseInstructions": modelOnlyInstructions,
+		"cwd":              runDir,
+		"ephemeral":        true,
+		"model":            request.UpstreamModel,
+		"sandbox":          "read-only",
+	}); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("start Codex thread: %w", err)})
+		return false
+	}
+	threadRaw, err := w.waitRPCResult(threadRPCID)
+	if err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("start Codex thread: %w", err)})
+		return false
+	}
+	var threadResult struct {
+		Model  string `json:"model"`
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(threadRaw, &threadResult); err != nil || threadResult.Thread.ID == "" {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex app-server returned an invalid thread")})
+		return false
+	}
+
+	turnParams := map[string]any{
+		"threadId": threadResult.Thread.ID,
+		"input":    []map[string]string{{"type": "text", "text": request.CanonicalInput}},
+	}
+	effort := request.ReasoningEffort
+	if effort == "" {
+		effort = config.DefaultReasoning
+	}
+	if effort != "" {
+		turnParams["effort"] = effort
+	}
+	if config.ServiceTier != "" {
+		turnParams["serviceTierForTurn"] = config.ServiceTier
+	}
+	turnRPCID := w.rpcID()
+	if err := w.writeRPC(turnRPCID, "turn/start", turnParams); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("start Codex turn: %w", err)})
+		return false
+	}
+	if _, err := w.waitRPCResult(turnRPCID); err != nil {
+		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("start Codex turn: %w", err)})
+		return false
+	}
+
+	var output strings.Builder
+	var reported pricing.ReportedUsage
+	usagePresent := false
+	for {
+		raw, err := w.nextMessage()
+		if err != nil {
+			if ctx.Err() == nil {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("read Codex events: %w", err)})
+			}
+			return false
+		}
+		var event appServerEvent
+		if err := json.Unmarshal(raw, &event); err != nil {
+			send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("decode Codex event: %w", err)})
+			return false
+		}
+		switch event.Method {
+		case "item/started", "item/completed":
+			var params itemLifecycleParams
+			if json.Unmarshal(event.Params, &params) != nil || (params.ThreadID != "" && params.ThreadID != threadResult.Thread.ID) {
+				continue
+			}
+			if !safeItemType(params.Item.Type) {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: fmt.Errorf("Codex attempted disallowed item %q", params.Item.Type)})
+				return false
+			}
+			if event.Method == "item/completed" && params.Item.Type == "agentMessage" && output.Len() == 0 && params.Item.Text != "" {
+				output.WriteString(params.Item.Text)
+				if !send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: params.Item.Text}) {
+					return false
+				}
+			}
+		case "item/agentMessage/delta":
+			var params struct {
+				ThreadID string `json:"threadId"`
+				Delta    string `json:"delta"`
+			}
+			if json.Unmarshal(event.Params, &params) != nil || params.Delta == "" || (params.ThreadID != "" && params.ThreadID != threadResult.Thread.ID) {
+				continue
+			}
+			output.WriteString(params.Delta)
+			if !send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: params.Delta}) {
+				return false
+			}
+		case "thread/tokenUsage/updated":
+			var params tokenUsageParams
+			if json.Unmarshal(event.Params, &params) == nil && (params.ThreadID == "" || params.ThreadID == threadResult.Thread.ID) {
+				reported.InputTokens = pricing.OptionalCount{Value: params.TokenUsage.Last.InputTokens, Present: true}
+				reported.OutputTokens = pricing.OptionalCount{Value: params.TokenUsage.Last.OutputTokens, Present: true}
+				usagePresent = true
+			}
+		case "turn/completed":
+			var params turnCompletedParams
+			if json.Unmarshal(event.Params, &params) != nil || (params.ThreadID != "" && params.ThreadID != threadResult.Thread.ID) {
+				continue
+			}
+			if params.Turn.Status != "completed" {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex turn failed")})
+				return false
+			}
+			if !usagePresent {
+				reported = pricing.ReportedUsage{}
+			}
+			effectiveModel := threadResult.Model
+			if effectiveModel == "" {
+				effectiveModel = request.UpstreamModel
+			}
+			stopCancellationWatch()
+			final := &provider.Final{OutputText: output.String(), EffectiveModel: effectiveModel, Usage: reported}
+			return send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: final}) && !w.closed.Load()
+		default:
+			// Account, rate-limit, reasoning and status notifications are not
+			// part of the public response and require no extra request.
+		}
+	}
+}
+
+func (w *appServerWorker) rpcID() int64 {
+	w.nextID++
+	return w.nextID
+}
+
+func (w *appServerWorker) writeRPC(id int64, method string, params any) error {
+	if w.closed.Load() {
+		return errors.New("Codex app-server is closed")
+	}
+	return w.encoder.Encode(map[string]any{"id": id, "method": method, "params": params})
+}
+
+func (w *appServerWorker) waitRPCResult(wantedID int64) (json.RawMessage, error) {
+	for {
+		raw, err := w.scanMessage()
+		if err != nil {
+			return nil, err
+		}
 		var envelope struct {
 			ID     int64           `json:"id"`
 			Result json.RawMessage `json:"result"`
 			Error  json.RawMessage `json:"error"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil {
+		if err := json.Unmarshal(raw, &envelope); err != nil {
 			return nil, err
 		}
 		if envelope.ID != wantedID {
+			w.pending = append(w.pending, raw)
 			continue
 		}
 		if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
@@ -285,123 +742,89 @@ func waitRPCResult(scanner *bufio.Scanner, wantedID int64) (json.RawMessage, err
 		}
 		return envelope.Result, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return nil, errors.New("Codex app-server ended before response")
 }
 
-func decodeRateLimits(raw json.RawMessage) (map[string]quotaWindow, error) {
-	type window struct {
-		UsedPercent        float64 `json:"usedPercent"`
-		WindowDurationMins int64   `json:"windowDurationMins"`
-		ResetsAt           int64   `json:"resetsAt"`
+func (w *appServerWorker) nextMessage() (json.RawMessage, error) {
+	if len(w.pending) > 0 {
+		raw := w.pending[0]
+		w.pending = w.pending[1:]
+		return raw, nil
 	}
-	type limit struct {
-		LimitID   string  `json:"limitId"`
-		Primary   *window `json:"primary"`
-		Secondary *window `json:"secondary"`
-	}
-	var result struct {
-		RateLimits          *limit           `json:"rateLimits"`
-		RateLimitsByLimitID map[string]limit `json:"rateLimitsByLimitId"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-	if len(result.RateLimitsByLimitID) == 0 && result.RateLimits != nil {
-		result.RateLimitsByLimitID = map[string]limit{result.RateLimits.LimitID: *result.RateLimits}
-	}
-	windows := make(map[string]quotaWindow)
-	for fallbackID, item := range result.RateLimitsByLimitID {
-		limitID := item.LimitID
-		if limitID == "" {
-			limitID = fallbackID
-		}
-		if item.Primary != nil {
-			windows[limitID+":primary"] = quotaWindow{item.Primary.UsedPercent, item.Primary.WindowDurationMins, item.Primary.ResetsAt}
-		}
-		if item.Secondary != nil {
-			windows[limitID+":secondary"] = quotaWindow{item.Secondary.UsedPercent, item.Secondary.WindowDurationMins, item.Secondary.ResetsAt}
-		}
-	}
-	return windows, nil
+	return w.scanMessage()
 }
 
-func compareQuota(before, after map[string]quotaWindow) []provider.QuotaObservation {
-	keys := make(map[string]struct{}, len(before)+len(after))
-	for key := range before {
-		keys[key] = struct{}{}
-	}
-	for key := range after {
-		keys[key] = struct{}{}
-	}
-	ordered := make([]string, 0, len(keys))
-	for key := range keys {
-		ordered = append(ordered, key)
-	}
-	sort.Strings(ordered)
-	result := make([]provider.QuotaObservation, 0, len(ordered))
-	for _, key := range ordered {
-		beforeValue, hasBefore := before[key]
-		afterValue, hasAfter := after[key]
-		observation := provider.QuotaObservation{LimitID: key, Unit: "percent_used", Status: "incomplete", Attribution: "shared_account_window"}
-		if hasBefore {
-			value := beforeValue.UsedPercent
-			observation.Before = &value
+func (w *appServerWorker) scanMessage() (json.RawMessage, error) {
+	if !w.scanner.Scan() {
+		if err := w.scanner.Err(); err != nil {
+			return nil, err
 		}
-		if hasAfter {
-			value := afterValue.UsedPercent
-			observation.After = &value
-			window := afterValue.WindowDurationMinutes
-			reset := afterValue.ResetsAt
-			observation.WindowDurationMinutes = &window
-			observation.ResetsAt = &reset
-		}
-		if hasBefore && hasAfter {
-			if beforeValue.WindowDurationMinutes == afterValue.WindowDurationMinutes && beforeValue.ResetsAt == afterValue.ResetsAt {
-				delta := afterValue.UsedPercent - beforeValue.UsedPercent
-				observation.Delta = &delta
-				observation.Status = "observed"
-			} else {
-				observation.Status = "window_changed"
-			}
-		}
-		result = append(result, observation)
+		return nil, errors.New("Codex app-server ended before response")
 	}
-	return result
+	return append(json.RawMessage(nil), w.scanner.Bytes()...), nil
+}
+
+func (w *appServerWorker) close() {
+	w.closeOnce.Do(func() {
+		w.closed.Store(true)
+		if w.stdin != nil {
+			_ = w.stdin.Close()
+		}
+		if w.command != nil {
+			_ = w.command.Cancel()
+			_ = w.command.Wait()
+		}
+		_ = os.RemoveAll(w.runtimeDir)
+	})
 }
 
 func safeItemType(itemType string) bool {
 	switch itemType {
-	case "agent_message", "reasoning":
+	case "userMessage", "agentMessage", "reasoning":
 		return true
 	default:
 		return false
 	}
 }
 
-type cliEvent struct {
-	Type string `json:"type"`
-	Item struct {
+type appServerEvent struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+type itemLifecycleParams struct {
+	ThreadID string `json:"threadId"`
+	Item     struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"item"`
-	Usage struct {
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-	} `json:"usage"`
 }
 
-func minimalEnvironment() []string {
-	allowed := []string{"HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL", "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-	result := make([]string, 0, len(allowed))
+type tokenUsageParams struct {
+	ThreadID   string `json:"threadId"`
+	TokenUsage struct {
+		Last struct {
+			InputTokens  int64 `json:"inputTokens"`
+			OutputTokens int64 `json:"outputTokens"`
+		} `json:"last"`
+	} `json:"tokenUsage"`
+}
+
+type turnCompletedParams struct {
+	ThreadID string `json:"threadId"`
+	Turn     struct {
+		Status string `json:"status"`
+	} `json:"turn"`
+}
+
+func minimalEnvironment(codexHome string) []string {
+	allowed := []string{"HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+	result := make([]string, 0, len(allowed)+1)
 	for _, key := range allowed {
 		if value, exists := os.LookupEnv(key); exists {
 			result = append(result, key+"="+value)
 		}
 	}
-	return result
+	return append(result, "CODEX_HOME="+codexHome)
 }
 
 func send(ctx context.Context, target chan<- provider.Event, event provider.Event) bool {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -32,6 +33,7 @@ type Deployment struct {
 	Price               pricing.PriceRevision
 	ActualPrice         *pricing.PriceRevision
 	ActualPoints        *pricing.PriceRevision
+	ReasoningEfforts    map[string]struct{}
 	Enabled             bool
 	HardBudgetSupported bool
 }
@@ -46,6 +48,7 @@ type Request struct {
 	Input           json.RawMessage
 	CanonicalInput  string
 	MaxOutputTokens *int64
+	ReasoningEffort string
 	RawRequest      json.RawMessage
 	Budget          *BudgetRequest
 	IdempotencyKey  string
@@ -75,15 +78,14 @@ type Event struct {
 }
 
 type Billing struct {
-	RequestID         string                      `json:"request_id"`
-	SettlementStatus  string                      `json:"settlement_status"`
-	PriceVersion      string                      `json:"price_version"`
-	Currency          string                      `json:"currency"`
-	Usage             BillingUsage                `json:"usage"`
-	UnitPrices        BillingUnitPrices           `json:"unit_prices"`
-	Charges           BillingCharges              `json:"charges"`
-	Budget            *BillingBudget              `json:"budget,omitempty"`
-	QuotaObservations []provider.QuotaObservation `json:"quota_observations,omitempty"`
+	RequestID        string            `json:"request_id"`
+	SettlementStatus string            `json:"settlement_status"`
+	PriceVersion     string            `json:"price_version"`
+	Currency         string            `json:"currency"`
+	Usage            BillingUsage      `json:"usage"`
+	UnitPrices       BillingUnitPrices `json:"unit_prices"`
+	Charges          BillingCharges    `json:"charges"`
+	Budget           *BillingBudget    `json:"budget,omitempty"`
 }
 
 type BillingUsage struct {
@@ -153,8 +155,12 @@ func NewService(deployments []config.DeploymentConfig, adapters []provider.Adapt
 				InputPerMillion:  inputRate,
 				OutputPerMillion: outputRate,
 			},
+			ReasoningEfforts:    make(map[string]struct{}, len(item.SupportedReasoningEffort)),
 			Enabled:             item.Enabled,
 			HardBudgetSupported: item.HardBudgetSupported,
+		}
+		for _, effort := range item.SupportedReasoningEffort {
+			deployment.ReasoningEfforts[effort] = struct{}{}
 		}
 		if item.ActualPrice != nil {
 			actualInput, parseErr := pricing.ParseDecimal(item.ActualPrice.InputPerMillion)
@@ -208,6 +214,16 @@ func (s *Service) Ready() bool {
 	return false
 }
 
+// Retire releases persistent provider resources without interrupting work that
+// was already handed to the old runtime snapshot.
+func (s *Service) Retire() {
+	for _, adapter := range s.providers {
+		if retirable, ok := adapter.(provider.Retirable); ok {
+			retirable.Retire()
+		}
+	}
+}
+
 func (s *Service) Start(ctx context.Context, client *auth.Client, request Request) (<-chan Event, string, error) {
 	deployment, exists := s.deployments[request.Model]
 	if !exists || !deployment.Enabled {
@@ -215,6 +231,11 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 	}
 	if client == nil || !client.Allows(deployment.ID) {
 		return nil, "", &Error{Status: http.StatusForbidden, Code: "model_not_allowed", Message: "client is not allowed to use this model"}
+	}
+	if request.ReasoningEffort != "" && len(deployment.ReasoningEfforts) > 0 {
+		if _, supported := deployment.ReasoningEfforts[request.ReasoningEffort]; !supported {
+			return nil, "", &Error{Status: http.StatusBadRequest, Code: "unsupported_reasoning_effort", Message: "reasoning effort is not supported by this deployment"}
+		}
 	}
 	runID, err := newRunID()
 	if err != nil {
@@ -279,6 +300,7 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 	}
 
 	adapter := s.providers[deployment.ProviderID]
+	startedAt := time.Now()
 	providerCtx, cancelProvider := context.WithCancel(ctx)
 	providerEvents, err := adapter.Start(providerCtx, provider.Request{
 		RunID:           runID,
@@ -288,6 +310,7 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 		Input:           request.Input,
 		CanonicalInput:  request.CanonicalInput,
 		MaxOutputTokens: request.MaxOutputTokens,
+		ReasoningEffort: request.ReasoningEffort,
 		RawRequest:      request.RawRequest,
 	})
 	if err != nil {
@@ -304,20 +327,23 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 			return nil, runID, &Error{Status: http.StatusInternalServerError, Code: "persistence_failed", Message: "request state could not be persisted", RequestID: runID}
 		}
 	}
+	providerStartedAt := time.Now()
 
 	events := make(chan Event)
-	go s.consume(providerCtx, cancelProvider, events, providerEvents, runID, deployment, request, parsedBudget, client.IncludeQuotaObservations)
+	go s.consume(providerCtx, cancelProvider, events, providerEvents, runID, deployment, request, parsedBudget, startedAt, providerStartedAt)
 	return events, runID, nil
 }
 
-func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events chan<- Event, providerEvents <-chan provider.Event, runID string, deployment Deployment, request Request, budget *pricing.Budget, includeQuota bool) {
+func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events chan<- Event, providerEvents <-chan provider.Event, runID string, deployment Deployment, request Request, budget *pricing.Budget, startedAt, providerStartedAt time.Time) {
 	defer close(events)
 	defer cancel()
 	var output strings.Builder
+	var firstDeltaAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			s.markFailed(runID, "unconfirmed", "request_cancelled")
+			logRunTiming("cancelled", runID, deployment, startedAt, providerStartedAt, firstDeltaAt)
 			return
 		case event, ok := <-providerEvents:
 			if !ok {
@@ -325,6 +351,9 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 			}
 			switch event.Type {
 			case provider.EventOutputTextDelta:
+				if firstDeltaAt.IsZero() {
+					firstDeltaAt = time.Now()
+				}
 				output.WriteString(event.Delta)
 				if !send(ctx, events, Event{Type: EventOutputTextDelta, Delta: event.Delta}) {
 					return
@@ -347,17 +376,13 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 				}
 				billing := newBilling(runID, deployment.Price, settlement, budget)
 				actualRecords := calculateActualRecords(deployment, usage, event.Final.Costs)
-				if includeQuota && len(event.Final.Quota) > 0 {
-					billing.QuotaObservations = append([]provider.QuotaObservation(nil), event.Final.Quota...)
-				}
 				response := publicResponse(runID, deployment.ID, event.Final.Response, outputText, usage)
 				if s.repository != nil {
 					responseJSON, responseErr := json.Marshal(response)
 					billingJSON, billingErr := json.Marshal(billing)
 					budgetJSON, budgetErr := json.Marshal(billing.Budget)
-					quotaJSON, quotaErr := json.Marshal(event.Final.Quota)
 					actualJSON, actualErr := json.Marshal(actualRecords)
-					if responseErr != nil || billingErr != nil || budgetErr != nil || quotaErr != nil || actualErr != nil {
+					if responseErr != nil || billingErr != nil || budgetErr != nil || actualErr != nil {
 						s.markFailed(runID, "failed", "settlement_encode_failed")
 						send(ctx, events, Event{Type: EventRunFailed, Error: &Error{Status: http.StatusInternalServerError, Code: "settlement_failed", Message: "settlement could not be persisted", RequestID: runID}})
 						return
@@ -382,7 +407,6 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 						InputUnitPrice: billing.UnitPrices.InputPerMillion, OutputUnitPrice: billing.UnitPrices.OutputPerMillion,
 						InputCharge: billing.Charges.Input, OutputCharge: billing.Charges.Output, TotalCharge: billing.Charges.Total,
 						BudgetJSON:       budgetJSON,
-						QuotaJSON:        quotaJSON,
 						ProviderID:       deployment.ProviderID,
 						UpstreamCostJSON: actualJSON,
 					})
@@ -397,6 +421,7 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 					return
 				}
 				send(ctx, events, Event{Type: EventRunCompleted, Response: response, Billing: &billing})
+				logRunTiming("completed", runID, deployment, startedAt, providerStartedAt, firstDeltaAt)
 				return
 			case provider.EventFailed:
 				s.markFailed(runID, "unconfirmed", "provider_stream_failed")
@@ -405,10 +430,27 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 					Code:    "provider_stream_failed",
 					Message: "provider stream failed before completion",
 				}})
+				logRunTiming("failed", runID, deployment, startedAt, providerStartedAt, firstDeltaAt)
 				return
 			}
 		}
 	}
+}
+
+func logRunTiming(status, runID string, deployment Deployment, startedAt, providerStartedAt, firstDeltaAt time.Time) {
+	firstDeltaMS := int64(-1)
+	if !firstDeltaAt.IsZero() {
+		firstDeltaMS = firstDeltaAt.Sub(startedAt).Milliseconds()
+	}
+	slog.Info("llm request timing",
+		"request_id", runID,
+		"deployment", deployment.ID,
+		"provider", deployment.ProviderID,
+		"status", status,
+		"provider_start_ms", providerStartedAt.Sub(startedAt).Milliseconds(),
+		"first_delta_ms", firstDeltaMS,
+		"total_ms", time.Since(startedAt).Milliseconds(),
+	)
 }
 
 type actualRecord struct {
@@ -477,6 +519,7 @@ func requestFingerprint(request Request) (string, error) {
 			"instructions":      request.Instructions,
 			"canonical_input":   request.CanonicalInput,
 			"max_output_tokens": request.MaxOutputTokens,
+			"reasoning_effort":  request.ReasoningEffort,
 		}
 	} else if err := json.Unmarshal(request.RawRequest, &value); err != nil {
 		return "", err

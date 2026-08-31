@@ -146,6 +146,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canonicalInput := strings.TrimSpace(strings.Join([]string{instructions, inputText}, "\n"))
+	reasoningEffort, err := parseReasoningEffort(request.Reasoning)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_reasoning", err.Error(), "reasoning.effort")
+		return
+	}
 
 	gatewayRequest := gateway.Request{
 		Model:           request.Model,
@@ -153,6 +158,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		Input:           request.Input,
 		CanonicalInput:  canonicalInput,
 		MaxOutputTokens: request.MaxOutputTokens,
+		ReasoningEffort: reasoningEffort,
 		RawRequest:      body,
 		IdempotencyKey:  request.LLMServer.IdempotencyKey,
 	}
@@ -181,6 +187,26 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeResponse(w, events, strict)
+}
+
+func parseReasoningEffort(raw json.RawMessage) (string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", nil
+	}
+	var reasoning struct {
+		Effort any `json:"effort"`
+	}
+	if err := json.Unmarshal(raw, &reasoning); err != nil {
+		return "", errors.New("reasoning must be an object")
+	}
+	if reasoning.Effort == nil {
+		return "", nil
+	}
+	effort, ok := reasoning.Effort.(string)
+	if !ok || strings.TrimSpace(effort) == "" {
+		return "", errors.New("reasoning.effort must be a non-empty string")
+	}
+	return strings.ToLower(strings.TrimSpace(effort)), nil
 }
 
 func (s *Server) writeResponse(w http.ResponseWriter, events <-chan gateway.Event, strict bool) {

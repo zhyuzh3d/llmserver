@@ -1,14 +1,9 @@
 package codex
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"os/exec"
-	"syscall"
-	"time"
 )
 
 type DiscoveredModel struct {
@@ -20,56 +15,19 @@ type DiscoveredModel struct {
 }
 
 func DiscoverModels(ctx context.Context, config Config) ([]DiscoveredModel, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	args := append([]string{}, config.ExtraArgs...)
-	args = append(args, "app-server", "--stdio")
-	command := exec.CommandContext(probeCtx, config.Executable, args...)
-	command.Env = minimalEnvironment()
-	command.Stderr = io.Discard
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	command.WaitDelay = 2 * time.Second
-	command.Cancel = func() error {
-		if command.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	stdin, err := command.StdinPipe()
+	worker, err := newAppServerWorker(config)
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := command.StdoutPipe()
-	if err != nil {
+	defer worker.close()
+	requestID := worker.rpcID()
+	if err := worker.writeRPC(requestID, "model/list", map[string]any{"limit": 100}); err != nil {
 		return nil, err
 	}
-	if err := command.Start(); err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = stdin.Close()
-		_ = command.Cancel()
-		_ = command.Wait()
-	}()
-	encoder := json.NewEncoder(stdin)
-	if err := encoder.Encode(map[string]any{
-		"id": 1, "method": "initialize",
-		"params": map[string]any{"clientInfo": map[string]string{"name": "llmserver-admin", "version": "0.2.0"}},
-	}); err != nil {
-		return nil, err
-	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
-	if _, err := waitRPCResult(scanner, 1); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(map[string]any{"id": 2, "method": "model/list", "params": map[string]any{"limit": 100}}); err != nil {
-		return nil, err
-	}
-	raw, err := waitRPCResult(scanner, 2)
+	raw, err := worker.waitRPCResult(requestID)
 	if err != nil {
 		return nil, err
 	}

@@ -198,14 +198,6 @@ func (s *SQLite) Complete(ctx context.Context, completion gateway.RunCompletion)
 	if err != nil {
 		return err
 	}
-	if len(completion.QuotaJSON) > 0 && string(completion.QuotaJSON) != "null" && string(completion.QuotaJSON) != "[]" {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO run_quota_observations(run_id, phase, payload_json, observed_at)
-			VALUES(?, 'completed', ?, ?)`, completion.RunID, completion.QuotaJSON, time.Now().UTC().Format(time.RFC3339Nano))
-		if err != nil {
-			return err
-		}
-	}
 	if len(completion.UpstreamCostJSON) > 0 && string(completion.UpstreamCostJSON) != "null" && string(completion.UpstreamCostJSON) != "[]" {
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO upstream_cost_records(run_id, provider_id, payload_json, observed_at)
@@ -248,7 +240,6 @@ func nullableBytes(value []byte) any {
 type UsageSummary struct {
 	Deployments []DeploymentUsage `json:"deployments"`
 	Actual      []ActualUsage     `json:"actual"`
-	Quotas      []QuotaUsage      `json:"quotas"`
 }
 
 type DeploymentUsage struct {
@@ -266,12 +257,6 @@ type ActualUsage struct {
 	Unit         string `json:"unit"`
 	Source       string `json:"source"`
 	Total        string `json:"total"`
-}
-
-type QuotaUsage struct {
-	DeploymentID string          `json:"deployment_id"`
-	ObservedAt   string          `json:"observed_at"`
-	Observations json.RawMessage `json:"observations"`
 }
 
 type UsageReportFilter struct {
@@ -297,7 +282,6 @@ type UsageGroup struct {
 	OutputTokens int64           `json:"output_tokens"`
 	PublicTotals []UnitTotal     `json:"public_totals"`
 	ActualTotals []ActualTotal   `json:"actual_totals"`
-	QuotaTotals  []QuotaTotal    `json:"quota_totals"`
 	Models       []ModelUsageRow `json:"models"`
 }
 
@@ -309,7 +293,6 @@ type ModelUsageRow struct {
 	OutputTokens int64         `json:"output_tokens"`
 	PublicTotals []UnitTotal   `json:"public_totals"`
 	ActualTotals []ActualTotal `json:"actual_totals"`
-	QuotaTotals  []QuotaTotal  `json:"quota_totals"`
 }
 
 type UnitTotal struct {
@@ -322,20 +305,6 @@ type ActualTotal struct {
 	Unit       string `json:"unit"`
 	Source     string `json:"source"`
 	Total      string `json:"total"`
-}
-
-type QuotaTotal struct {
-	ProviderID            string   `json:"provider_id"`
-	DeploymentID          string   `json:"deployment_id,omitempty"`
-	LimitID               string   `json:"limit_id"`
-	Unit                  string   `json:"unit"`
-	Delta                 float64  `json:"delta"`
-	LatestBefore          *float64 `json:"latest_before,omitempty"`
-	LatestAfter           *float64 `json:"latest_after,omitempty"`
-	WindowDurationMinutes *int64   `json:"window_duration_minutes,omitempty"`
-	ResetsAt              *int64   `json:"resets_at,omitempty"`
-	Observations          int64    `json:"observations"`
-	Status                string   `json:"status"`
 }
 
 func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
@@ -438,26 +407,6 @@ func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
 		return summary, err
 	}
 
-	quotaRows, err := s.db.QueryContext(ctx, `
-		SELECT r.deployment_id, q.observed_at, q.payload_json
-		FROM run_quota_observations q JOIN runs r ON r.id = q.run_id
-		ORDER BY q.observed_at DESC LIMIT 50`)
-	if err != nil {
-		return summary, err
-	}
-	for quotaRows.Next() {
-		var item QuotaUsage
-		var payload []byte
-		if err := quotaRows.Scan(&item.DeploymentID, &item.ObservedAt, &payload); err != nil {
-			quotaRows.Close()
-			return summary, err
-		}
-		item.Observations = append(json.RawMessage(nil), payload...)
-		summary.Quotas = append(summary.Quotas, item)
-	}
-	if err := quotaRows.Close(); err != nil {
-		return summary, err
-	}
 	return summary, nil
 }
 
@@ -468,7 +417,6 @@ type reportBucket struct {
 	outputTokens int64
 	public       map[string]pricing.Decimal
 	actual       map[string]pricing.Decimal
-	quota        map[string]*QuotaTotal
 	models       map[string]*reportModel
 }
 
@@ -479,7 +427,6 @@ type reportModel struct {
 	outputTokens int64
 	public       map[string]pricing.Decimal
 	actual       map[string]pricing.Decimal
-	quota        map[string]*QuotaTotal
 }
 
 func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (UsageReport, error) {
@@ -597,61 +544,6 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 		return report, err
 	}
 
-	quotaRows, err := s.db.QueryContext(ctx, `
-		SELECT r.client_id, r.deployment_id, q.payload_json
-		FROM run_quota_observations q JOIN runs r ON r.id = q.run_id
-		WHERE r.status = 'completed' AND q.observed_at >= ? AND q.observed_at < ?
-		ORDER BY q.observed_at`, report.Since, report.Until)
-	if err != nil {
-		return report, err
-	}
-	type quotaObservation struct {
-		LimitID               string   `json:"limit_id"`
-		Unit                  string   `json:"unit"`
-		Before                *float64 `json:"before"`
-		After                 *float64 `json:"after"`
-		Delta                 *float64 `json:"delta"`
-		WindowDurationMinutes *int64   `json:"window_duration_minutes"`
-		ResetsAt              *int64   `json:"resets_at"`
-		Status                string   `json:"status"`
-	}
-	for quotaRows.Next() {
-		var clientID, deploymentID string
-		var payload []byte
-		if err := quotaRows.Scan(&clientID, &deploymentID, &payload); err != nil {
-			quotaRows.Close()
-			return report, err
-		}
-		providerID := filter.ProviderByDeployment[deploymentID]
-		if providerID == "" {
-			providerID = "unknown"
-		}
-		if !reportRunMatches(filter, clientID, providerID) {
-			continue
-		}
-		groupID := providerID
-		if filter.GroupBy == "client" {
-			groupID = clientID
-		}
-		bucket := ensureReportBucket(buckets, groupID)
-		model := ensureReportModel(bucket, deploymentID, providerID)
-		var observations []quotaObservation
-		if err := json.Unmarshal(payload, &observations); err != nil {
-			continue
-		}
-		for _, observation := range observations {
-			addQuota(bucket.quota, providerID, "", observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta, observation.WindowDurationMinutes, observation.ResetsAt)
-			addQuota(model.quota, providerID, deploymentID, observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta, observation.WindowDurationMinutes, observation.ResetsAt)
-		}
-	}
-	if err := quotaRows.Err(); err != nil {
-		quotaRows.Close()
-		return report, err
-	}
-	if err := quotaRows.Close(); err != nil {
-		return report, err
-	}
-
 	report.Groups = renderReportBuckets(buckets)
 	return report, nil
 }
@@ -664,7 +556,7 @@ func ensureReportBucket(buckets map[string]*reportBucket, id string) *reportBuck
 	if bucket := buckets[id]; bucket != nil {
 		return bucket
 	}
-	bucket := &reportBucket{id: id, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}, quota: map[string]*QuotaTotal{}, models: map[string]*reportModel{}}
+	bucket := &reportBucket{id: id, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}, models: map[string]*reportModel{}}
 	buckets[id] = bucket
 	return bucket
 }
@@ -673,7 +565,7 @@ func ensureReportModel(bucket *reportBucket, deploymentID, providerID string) *r
 	if model := bucket.models[deploymentID]; model != nil {
 		return model
 	}
-	model := &reportModel{providerID: providerID, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}, quota: map[string]*QuotaTotal{}}
+	model := &reportModel{providerID: providerID, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}}
 	bucket.models[deploymentID] = model
 	return model
 }
@@ -695,24 +587,6 @@ func addReportDecimal(target map[string]pricing.Decimal, key, raw string) error 
 	return nil
 }
 
-func addQuota(target map[string]*QuotaTotal, providerID, deploymentID, limitID, unit, status string, before, after, delta *float64, windowDurationMinutes, resetsAt *int64) {
-	key := providerID + "\x00" + deploymentID + "\x00" + limitID + "\x00" + unit
-	item := target[key]
-	if item == nil {
-		item = &QuotaTotal{ProviderID: providerID, DeploymentID: deploymentID, LimitID: limitID, Unit: unit, Status: status}
-		target[key] = item
-	}
-	item.Observations++
-	item.Status = status
-	item.LatestBefore = before
-	item.LatestAfter = after
-	item.WindowDurationMinutes = windowDurationMinutes
-	item.ResetsAt = resetsAt
-	if status == "observed" && delta != nil {
-		item.Delta += *delta
-	}
-}
-
 func renderReportBuckets(buckets map[string]*reportBucket) []UsageGroup {
 	ids := make([]string, 0, len(buckets))
 	for id := range buckets {
@@ -722,7 +596,7 @@ func renderReportBuckets(buckets map[string]*reportBucket) []UsageGroup {
 	groups := make([]UsageGroup, 0, len(ids))
 	for _, id := range ids {
 		bucket := buckets[id]
-		group := UsageGroup{ID: id, Runs: int64(len(bucket.runIDs)), InputTokens: bucket.inputTokens, OutputTokens: bucket.outputTokens, PublicTotals: renderUnitTotals(bucket.public), ActualTotals: renderActualTotals(bucket.actual), QuotaTotals: renderQuotaTotals(bucket.quota)}
+		group := UsageGroup{ID: id, Runs: int64(len(bucket.runIDs)), InputTokens: bucket.inputTokens, OutputTokens: bucket.outputTokens, PublicTotals: renderUnitTotals(bucket.public), ActualTotals: renderActualTotals(bucket.actual)}
 		modelIDs := make([]string, 0, len(bucket.models))
 		for modelID := range bucket.models {
 			modelIDs = append(modelIDs, modelID)
@@ -730,7 +604,7 @@ func renderReportBuckets(buckets map[string]*reportBucket) []UsageGroup {
 		sort.Strings(modelIDs)
 		for _, modelID := range modelIDs {
 			model := bucket.models[modelID]
-			group.Models = append(group.Models, ModelUsageRow{DeploymentID: modelID, ProviderID: model.providerID, Runs: int64(len(model.runIDs)), InputTokens: model.inputTokens, OutputTokens: model.outputTokens, PublicTotals: renderUnitTotals(model.public), ActualTotals: renderActualTotals(model.actual), QuotaTotals: renderQuotaTotals(model.quota)})
+			group.Models = append(group.Models, ModelUsageRow{DeploymentID: modelID, ProviderID: model.providerID, Runs: int64(len(model.runIDs)), InputTokens: model.inputTokens, OutputTokens: model.outputTokens, PublicTotals: renderUnitTotals(model.public), ActualTotals: renderActualTotals(model.actual)})
 		}
 		groups = append(groups, group)
 	}
@@ -763,19 +637,6 @@ func renderActualTotals(values map[string]pricing.Decimal) []ActualTotal {
 			continue
 		}
 		result = append(result, ActualTotal{ProviderID: parts[0], Unit: parts[1], Source: parts[2], Total: values[key].String()})
-	}
-	return result
-}
-
-func renderQuotaTotals(values map[string]*QuotaTotal) []QuotaTotal {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	result := make([]QuotaTotal, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, *values[key])
 	}
 	return result
 }
@@ -835,16 +696,6 @@ CREATE TABLE IF NOT EXISTS run_charges (
     total_charge TEXT NOT NULL,
     budget_json BLOB
 );
-
-CREATE TABLE IF NOT EXISTS run_quota_observations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(id),
-    phase TEXT NOT NULL,
-    payload_json BLOB NOT NULL,
-    observed_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS run_quota_observations_run_time_idx ON run_quota_observations(run_id, observed_at);
-CREATE INDEX IF NOT EXISTS run_quota_observations_time_idx ON run_quota_observations(observed_at);
 
 CREATE TABLE IF NOT EXISTS upstream_cost_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

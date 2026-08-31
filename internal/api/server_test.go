@@ -42,7 +42,7 @@ func TestResponsesNonStreamingReturnsPublicBilling(t *testing.T) {
 		t.Fatal("public response leaked pricing basis")
 	}
 	if _, exists := billing["quota_observations"]; exists {
-		t.Fatal("quota must be omitted for the default client policy")
+		t.Fatal("quota observations are not part of the public response contract")
 	}
 	charges := billing["charges"].(map[string]any)
 	if charges["total"] != "0.000048000" {
@@ -106,6 +106,25 @@ func TestUnauthorizedRequestDoesNotStartProvider(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || counter.starts != 0 {
+		t.Fatalf("status=%d starts=%d body=%s", response.Code, counter.starts, response.Body.String())
+	}
+}
+
+func TestReasoningEffortIsValidatedAndForwarded(t *testing.T) {
+	counter := &countingAdapter{Adapter: mock.Adapter{ProviderID: "mock", ResponseText: "ok"}}
+	server := newTestServer(t, counter)
+	request := newRequest(t, http.MethodPost, "/v1/responses", `{"model":"terra","input":"hello","reasoning":{"effort":"LOW"}}`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || counter.lastRequest.ReasoningEffort != "low" {
+		t.Fatalf("status=%d effort=%q body=%s", response.Code, counter.lastRequest.ReasoningEffort, response.Body.String())
+	}
+
+	counter.starts = 0
+	request = newRequest(t, http.MethodPost, "/v1/responses", `{"model":"terra","input":"hello","reasoning":{"effort":"ultra"}}`)
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || counter.starts != 0 || !strings.Contains(response.Body.String(), "unsupported_reasoning_effort") {
 		t.Fatalf("status=%d starts=%d body=%s", response.Code, counter.starts, response.Body.String())
 	}
 }
@@ -196,9 +215,10 @@ func newTestServer(t *testing.T, adapter provider.Adapter) *Server {
 	}
 	service, err := gateway.NewService([]config.DeploymentConfig{
 		{
-			ID:            "terra",
-			ProviderID:    "mock",
-			UpstreamModel: "mock-terra",
+			ID:                       "terra",
+			ProviderID:               "mock",
+			UpstreamModel:            "mock-terra",
+			SupportedReasoningEffort: []string{"low", "high"},
 			Price: config.PriceConfig{
 				Revision:         "internal-manual-price",
 				Currency:         "USD",
@@ -223,7 +243,7 @@ func newTestServer(t *testing.T, adapter provider.Adapter) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authenticator := auth.New(auth.NewClient("device", "client-secret", []string{"terra"}, false))
+	authenticator := auth.New(auth.NewClient("device", "client-secret", []string{"terra"}))
 	return NewServer(authenticator, service)
 }
 
@@ -241,15 +261,17 @@ func newPersistentTestServer(t *testing.T, adapter provider.Adapter) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(auth.New(auth.NewClient("device", "client-secret", []string{"terra"}, false)), service)
+	return NewServer(auth.New(auth.NewClient("device", "client-secret", []string{"terra"})), service)
 }
 
 type countingAdapter struct {
 	mock.Adapter
-	starts int
+	starts      int
+	lastRequest provider.Request
 }
 
 func (a *countingAdapter) Start(ctx context.Context, request provider.Request) (<-chan provider.Event, error) {
 	a.starts++
+	a.lastRequest = request
 	return a.Adapter.Start(ctx, request)
 }

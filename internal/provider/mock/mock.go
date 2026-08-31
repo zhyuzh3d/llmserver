@@ -16,7 +16,6 @@ type Adapter struct {
 	ReportedInput  *int64
 	ReportedOutput *int64
 	DeltaDelay     time.Duration
-	Quota          []provider.QuotaObservation
 }
 
 func (a *Adapter) ID() string { return a.ProviderID }
@@ -55,7 +54,6 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 			OutputText:     built.String(),
 			EffectiveModel: request.UpstreamModel,
 			Usage:          usage,
-			Quota:          append([]provider.QuotaObservation(nil), a.Quota...),
 		}
 		select {
 		case <-ctx.Done():
