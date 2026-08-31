@@ -62,7 +62,7 @@ func standardModels(ctx context.Context, provider config.ProviderConfig) ([]Mode
 	if provider.APIKey.IsEmpty() {
 		return nil, errors.New("provider API key is not configured")
 	}
-	endpoint, err := modelsEndpoint(provider.BaseURL)
+	endpoint, err := modelsEndpoint(provider.BaseURL, provider.ModelsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +72,11 @@ func standardModels(ctx context.Context, provider config.ProviderConfig) ([]Mode
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Authorization", "Bearer "+provider.APIKey.Reveal())
+	authHeader, authPrefix, err := authentication(provider.APIKeyHeader, provider.APIKeyPrefix)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set(authHeader, authValue(authPrefix, provider.APIKey.Reveal()))
 	request.Header.Set("Accept", "application/json")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -115,7 +119,15 @@ func standardModels(ctx context.Context, provider config.ProviderConfig) ([]Mode
 	return models, nil
 }
 
-func modelsEndpoint(baseURL string) (string, error) {
+func modelsEndpoint(baseURL, explicitURL string) (string, error) {
+	if strings.TrimSpace(explicitURL) != "" {
+		parsed, err := url.Parse(strings.TrimSpace(explicitURL))
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return "", errors.New("invalid provider models URL")
+		}
+		parsed.Fragment = ""
+		return parsed.String(), nil
+	}
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", errors.New("invalid provider base URL")
@@ -129,7 +141,33 @@ func modelsEndpoint(baseURL string) (string, error) {
 		path += "/v1/models"
 	}
 	parsed.Path = path
-	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+func authentication(header, prefix string) (string, string, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		header = "Authorization"
+	}
+	if strings.ContainsAny(header, "\r\n:") {
+		return "", "", errors.New("provider API key header is invalid")
+	}
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "Bearer"
+	} else if strings.EqualFold(prefix, "none") {
+		prefix = ""
+	}
+	if strings.ContainsAny(prefix, "\r\n") {
+		return "", "", errors.New("provider API key prefix is invalid")
+	}
+	return header, prefix, nil
+}
+
+func authValue(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + " " + key
 }

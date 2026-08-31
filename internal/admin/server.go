@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,9 +116,62 @@ func (s *Server) handleDiscoverModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 5*time.Second)
 	defer cancel()
-	summary, err := s.store.UsageSummary(ctx)
+	windowValue := 1
+	if raw := r.URL.Query().Get("window_value"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "window_value must be an integer")
+			return
+		}
+		windowValue = parsed
+	}
+	windowUnit := r.URL.Query().Get("window_unit")
+	if windowUnit == "" {
+		windowUnit = "days"
+	}
+	var duration time.Duration
+	switch windowUnit {
+	case "hours":
+		if windowValue < 1 || windowValue > 8760 {
+			writeError(w, http.StatusBadRequest, "hour window must be between 1 and 8760")
+			return
+		}
+		duration = time.Duration(windowValue) * time.Hour
+	case "days":
+		if windowValue < 1 || windowValue > 365 {
+			writeError(w, http.StatusBadRequest, "day window must be between 1 and 365")
+			return
+		}
+		duration = time.Duration(windowValue) * 24 * time.Hour
+	default:
+		writeError(w, http.StatusBadRequest, "window_unit must be hours or days")
+		return
+	}
+	groupBy := r.URL.Query().Get("group_by")
+	if groupBy == "" {
+		groupBy = "provider"
+	}
+	if groupBy != "provider" && groupBy != "client" {
+		writeError(w, http.StatusBadRequest, "group_by must be provider or client")
+		return
+	}
+	snapshot := s.manager.Snapshot()
+	if snapshot == nil {
+		writeError(w, http.StatusServiceUnavailable, "runtime is not ready")
+		return
+	}
+	providers := make(map[string]string, len(snapshot.Config.Deployments))
+	for _, deployment := range snapshot.Config.Deployments {
+		providers[deployment.ID] = deployment.ProviderID
+	}
+	until := time.Now().UTC()
+	summary, err := s.store.UsageReport(ctx, store.UsageReportFilter{
+		Since: until.Add(-duration), Until: until, GroupBy: groupBy,
+		ProviderID: r.URL.Query().Get("provider_id"), ClientID: r.URL.Query().Get("client_id"),
+		ProviderByDeployment: providers,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read usage summary")
+		writeError(w, http.StatusInternalServerError, "could not read usage report")
 		return
 	}
 	writeJSON(w, http.StatusOK, summary)

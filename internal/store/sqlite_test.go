@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/zhyuzh3d/llmserver/internal/gateway"
 )
@@ -97,6 +98,16 @@ func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
 	if string(stored) != string(quota) {
 		t.Fatalf("quota = %s", stored)
 	}
+	report, err := repository.UsageReport(context.Background(), UsageReportFilter{
+		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute), GroupBy: "provider",
+		ProviderByDeployment: map[string]string{"codex": "codex-local"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Groups) != 1 || len(report.Groups[0].QuotaTotals) != 1 || report.Groups[0].QuotaTotals[0].Delta != 1 {
+		t.Fatalf("quota report = %#v", report.Groups)
+	}
 }
 
 func TestUsageSummarySeparatesPublicChargeAndActualEstimate(t *testing.T) {
@@ -131,5 +142,25 @@ func TestUsageSummarySeparatesPublicChargeAndActualEstimate(t *testing.T) {
 	}
 	if len(summary.Actual) != 1 || summary.Actual[0].Unit != "CNY" || summary.Actual[0].Total != "0.000040000" || summary.Actual[0].Source != "configured_estimate" {
 		t.Fatalf("actual summary = %#v", summary.Actual)
+	}
+	report, err := repository.UsageReport(context.Background(), UsageReportFilter{
+		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute), GroupBy: "provider",
+		ProviderByDeployment: map[string]string{"model": "api"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Groups) != 1 || report.Groups[0].ID != "api" || report.Groups[0].Runs != 1 || len(report.Groups[0].Models) != 1 {
+		t.Fatalf("provider report = %#v", report.Groups)
+	}
+	if report.Groups[0].PublicTotals[0].Total != "0.000080000" || report.Groups[0].ActualTotals[0].Total != "0.000040000" {
+		t.Fatalf("provider totals = %#v %#v", report.Groups[0].PublicTotals, report.Groups[0].ActualTotals)
+	}
+	clientReport, err := repository.UsageReport(context.Background(), UsageReportFilter{
+		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute), GroupBy: "client", ClientID: "device",
+		ProviderByDeployment: map[string]string{"model": "api"},
+	})
+	if err != nil || len(clientReport.Groups) != 1 || clientReport.Groups[0].ID != "device" {
+		t.Fatalf("client report = %#v err=%v", clientReport.Groups, err)
 	}
 }

@@ -35,11 +35,34 @@ func TestStandardModelsUsesBearerKeyAndAcceptsDataShape(t *testing.T) {
 }
 
 func TestModelsEndpointPreservesVersionedBasePath(t *testing.T) {
-	endpoint, err := modelsEndpoint("https://example.test/proxy/v1/")
+	endpoint, err := modelsEndpoint("https://example.test/proxy/v1/", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if endpoint != "https://example.test/proxy/v1/models" {
 		t.Fatalf("endpoint = %q", endpoint)
+	}
+}
+
+func TestStandardModelsSupportsExplicitURLAndAPIKeyHeader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/catalog" || r.URL.Query().Get("api-version") != "v2" {
+			t.Fatalf("request URL = %s", r.URL.String())
+		}
+		if r.Header.Get("api-key") != "secret" || r.Header.Get("Authorization") != "" {
+			t.Fatal("custom API key header was not used")
+		}
+		_, _ = w.Write([]byte(`{"models":[{"id":"custom"}]}`))
+	}))
+	defer server.Close()
+	models, err := Models(context.Background(), config.ProviderConfig{
+		ID: "api", Type: "openai_responses", BaseURL: server.URL, ModelsURL: server.URL + "/catalog?api-version=v2",
+		APIKey: config.NewSecret("secret"), APIKeyHeader: "api-key", APIKeyPrefix: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "custom" {
+		t.Fatalf("models = %#v", models)
 	}
 }

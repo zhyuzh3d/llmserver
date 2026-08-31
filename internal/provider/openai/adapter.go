@@ -27,24 +27,43 @@ type Adapter struct {
 	providerID string
 	endpoint   string
 	apiKey     config.Secret
+	authHeader string
+	authPrefix string
 	client     *http.Client
 }
 
+type Config struct {
+	ProviderID   string
+	BaseURL      string
+	ResponsesURL string
+	APIKey       config.Secret
+	APIKeyHeader string
+	APIKeyPrefix string
+}
+
 func New(providerID, baseURL string, apiKey config.Secret, client *http.Client) (*Adapter, error) {
-	if providerID == "" {
+	return NewConfigured(Config{ProviderID: providerID, BaseURL: baseURL, APIKey: apiKey}, client)
+}
+
+func NewConfigured(providerConfig Config, client *http.Client) (*Adapter, error) {
+	if providerConfig.ProviderID == "" {
 		return nil, errors.New("provider id is required")
 	}
-	endpoint, err := responsesEndpoint(baseURL)
+	endpoint, err := responsesEndpoint(providerConfig.BaseURL, providerConfig.ResponsesURL)
 	if err != nil {
 		return nil, err
 	}
-	if apiKey.IsEmpty() {
+	if providerConfig.APIKey.IsEmpty() {
 		return nil, errors.New("provider API key is empty")
+	}
+	authHeader, authPrefix, err := normalizeAuthentication(providerConfig.APIKeyHeader, providerConfig.APIKeyPrefix)
+	if err != nil {
+		return nil, err
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
-	return &Adapter{providerID: providerID, endpoint: endpoint, apiKey: apiKey, client: client}, nil
+	return &Adapter{providerID: providerConfig.ProviderID, endpoint: endpoint, apiKey: providerConfig.APIKey, authHeader: authHeader, authPrefix: authPrefix, client: client}, nil
 }
 
 func (a *Adapter) ID() string { return a.providerID }
@@ -58,7 +77,7 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 	if err != nil {
 		return nil, fmt.Errorf("create provider request: %w", err)
 	}
-	httpRequest.Header.Set("Authorization", "Bearer "+a.apiKey.Reveal())
+	httpRequest.Header.Set(a.authHeader, credentialValue(a.authPrefix, a.apiKey.Reveal()))
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("User-Agent", "llmserver/0.1")
 	if streaming {
@@ -88,7 +107,10 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 	return events, nil
 }
 
-func responsesEndpoint(baseURL string) (string, error) {
+func responsesEndpoint(baseURL, explicitURL string) (string, error) {
+	if strings.TrimSpace(explicitURL) != "" {
+		return validateEndpoint(explicitURL, "responses")
+	}
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("invalid provider base URL")
@@ -102,9 +124,44 @@ func responsesEndpoint(baseURL string) (string, error) {
 		path += "/v1/responses"
 	}
 	parsed.Path = path
-	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+func validateEndpoint(rawURL, label string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid provider %s URL", label)
+	}
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func normalizeAuthentication(header, prefix string) (string, string, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		header = "Authorization"
+	}
+	if strings.ContainsAny(header, "\r\n:") {
+		return "", "", errors.New("provider API key header is invalid")
+	}
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "Bearer"
+	} else if strings.EqualFold(prefix, "none") {
+		prefix = ""
+	}
+	if strings.ContainsAny(prefix, "\r\n") {
+		return "", "", errors.New("provider API key prefix is invalid")
+	}
+	return header, prefix, nil
+}
+
+func credentialValue(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + " " + key
 }
 
 func buildRequestBody(request provider.Request) ([]byte, bool, error) {

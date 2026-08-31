@@ -20,6 +20,8 @@ providers:
       display_name: OpenAI-compatible API
       base_url: https://ai.ai-mesh.cn
       wire_api: responses
+      api_key_header: Authorization
+      api_key_prefix: Bearer
       default_public_price:
         revision: api-default-public-v1
         currency: USD

@@ -18,7 +18,7 @@ type DiscoveredModel struct {
 var supportedModelsPattern = regexp.MustCompile(`Currently supported:\s*\(([^)]*)\)`)
 
 func DiscoverModels(ctx context.Context, config Config) ([]DiscoveredModel, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	command := exec.CommandContext(probeCtx, config.Executable, "--help")
 	command.Env = minimalEnvironment(os.TempDir())

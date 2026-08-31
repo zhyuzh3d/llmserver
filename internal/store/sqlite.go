@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/zhyuzh3d/llmserver/internal/gateway"
@@ -272,6 +274,68 @@ type QuotaUsage struct {
 	Observations json.RawMessage `json:"observations"`
 }
 
+type UsageReportFilter struct {
+	Since                time.Time
+	Until                time.Time
+	GroupBy              string
+	ProviderID           string
+	ClientID             string
+	ProviderByDeployment map[string]string
+}
+
+type UsageReport struct {
+	Since   string       `json:"since"`
+	Until   string       `json:"until"`
+	GroupBy string       `json:"group_by"`
+	Groups  []UsageGroup `json:"groups"`
+}
+
+type UsageGroup struct {
+	ID           string          `json:"id"`
+	Runs         int64           `json:"runs"`
+	InputTokens  int64           `json:"input_tokens"`
+	OutputTokens int64           `json:"output_tokens"`
+	PublicTotals []UnitTotal     `json:"public_totals"`
+	ActualTotals []ActualTotal   `json:"actual_totals"`
+	QuotaTotals  []QuotaTotal    `json:"quota_totals"`
+	Models       []ModelUsageRow `json:"models"`
+}
+
+type ModelUsageRow struct {
+	DeploymentID string        `json:"deployment_id"`
+	ProviderID   string        `json:"provider_id"`
+	Runs         int64         `json:"runs"`
+	InputTokens  int64         `json:"input_tokens"`
+	OutputTokens int64         `json:"output_tokens"`
+	PublicTotals []UnitTotal   `json:"public_totals"`
+	ActualTotals []ActualTotal `json:"actual_totals"`
+	QuotaTotals  []QuotaTotal  `json:"quota_totals"`
+}
+
+type UnitTotal struct {
+	Unit  string `json:"unit"`
+	Total string `json:"total"`
+}
+
+type ActualTotal struct {
+	ProviderID string `json:"provider_id"`
+	Unit       string `json:"unit"`
+	Source     string `json:"source"`
+	Total      string `json:"total"`
+}
+
+type QuotaTotal struct {
+	ProviderID   string   `json:"provider_id"`
+	DeploymentID string   `json:"deployment_id,omitempty"`
+	LimitID      string   `json:"limit_id"`
+	Unit         string   `json:"unit"`
+	Delta        float64  `json:"delta"`
+	LatestBefore *float64 `json:"latest_before,omitempty"`
+	LatestAfter  *float64 `json:"latest_after,omitempty"`
+	Observations int64    `json:"observations"`
+	Status       string   `json:"status"`
+}
+
 func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
 	var summary UsageSummary
 	rows, err := s.db.QueryContext(ctx, `
@@ -395,6 +459,321 @@ func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
 	return summary, nil
 }
 
+type reportBucket struct {
+	id           string
+	runIDs       map[string]struct{}
+	inputTokens  int64
+	outputTokens int64
+	public       map[string]pricing.Decimal
+	actual       map[string]pricing.Decimal
+	quota        map[string]*QuotaTotal
+	models       map[string]*reportModel
+}
+
+type reportModel struct {
+	providerID   string
+	runIDs       map[string]struct{}
+	inputTokens  int64
+	outputTokens int64
+	public       map[string]pricing.Decimal
+	actual       map[string]pricing.Decimal
+	quota        map[string]*QuotaTotal
+}
+
+func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (UsageReport, error) {
+	if filter.GroupBy != "provider" && filter.GroupBy != "client" {
+		return UsageReport{}, errors.New("usage report group_by must be provider or client")
+	}
+	if filter.Until.IsZero() {
+		filter.Until = time.Now().UTC()
+	}
+	if filter.Since.IsZero() || !filter.Since.Before(filter.Until) {
+		return UsageReport{}, errors.New("usage report requires a valid time window")
+	}
+	report := UsageReport{Since: filter.Since.UTC().Format(time.RFC3339Nano), Until: filter.Until.UTC().Format(time.RFC3339Nano), GroupBy: filter.GroupBy}
+	buckets := map[string]*reportBucket{}
+
+	publicRows, err := s.db.QueryContext(ctx, `
+		SELECT r.id, r.client_id, r.deployment_id, ru.input_tokens, ru.output_tokens, rc.currency, rc.total_charge
+		FROM runs r JOIN run_usage ru ON ru.run_id = r.id JOIN run_charges rc ON rc.run_id = r.id
+		WHERE r.status = 'completed' AND r.settlement_status = 'confirmed' AND r.created_at >= ? AND r.created_at < ?
+		ORDER BY r.created_at`, report.Since, report.Until)
+	if err != nil {
+		return report, err
+	}
+	for publicRows.Next() {
+		var runID, clientID, deploymentID, currency, total string
+		var inputTokens, outputTokens int64
+		if err := publicRows.Scan(&runID, &clientID, &deploymentID, &inputTokens, &outputTokens, &currency, &total); err != nil {
+			publicRows.Close()
+			return report, err
+		}
+		providerID := filter.ProviderByDeployment[deploymentID]
+		if providerID == "" {
+			providerID = "unknown"
+		}
+		if !reportRunMatches(filter, clientID, providerID) {
+			continue
+		}
+		groupID := providerID
+		if filter.GroupBy == "client" {
+			groupID = clientID
+		}
+		bucket := ensureReportBucket(buckets, groupID)
+		model := ensureReportModel(bucket, deploymentID, providerID)
+		bucket.runIDs[runID] = struct{}{}
+		model.runIDs[runID] = struct{}{}
+		bucket.inputTokens += inputTokens
+		bucket.outputTokens += outputTokens
+		model.inputTokens += inputTokens
+		model.outputTokens += outputTokens
+		if err := addReportDecimal(bucket.public, currency, total); err != nil {
+			publicRows.Close()
+			return report, err
+		}
+		if err := addReportDecimal(model.public, currency, total); err != nil {
+			publicRows.Close()
+			return report, err
+		}
+	}
+	if err := publicRows.Err(); err != nil {
+		publicRows.Close()
+		return report, err
+	}
+	if err := publicRows.Close(); err != nil {
+		return report, err
+	}
+
+	actualRows, err := s.db.QueryContext(ctx, `
+		SELECT r.client_id, r.deployment_id, u.provider_id, u.payload_json
+		FROM upstream_cost_records u JOIN runs r ON r.id = u.run_id
+		WHERE r.status = 'completed' AND u.observed_at >= ? AND u.observed_at < ?
+		ORDER BY u.observed_at`, report.Since, report.Until)
+	if err != nil {
+		return report, err
+	}
+	type actualRecord struct {
+		Unit   string `json:"unit"`
+		Source string `json:"source"`
+		Total  string `json:"total"`
+	}
+	for actualRows.Next() {
+		var clientID, deploymentID, providerID string
+		var payload []byte
+		if err := actualRows.Scan(&clientID, &deploymentID, &providerID, &payload); err != nil {
+			actualRows.Close()
+			return report, err
+		}
+		if !reportRunMatches(filter, clientID, providerID) {
+			continue
+		}
+		groupID := providerID
+		if filter.GroupBy == "client" {
+			groupID = clientID
+		}
+		bucket := ensureReportBucket(buckets, groupID)
+		model := ensureReportModel(bucket, deploymentID, providerID)
+		var records []actualRecord
+		if err := json.Unmarshal(payload, &records); err != nil {
+			continue
+		}
+		for _, record := range records {
+			key := providerID + "\x00" + record.Unit + "\x00" + record.Source
+			if err := addReportDecimal(bucket.actual, key, record.Total); err != nil {
+				continue
+			}
+			if err := addReportDecimal(model.actual, key, record.Total); err != nil {
+				continue
+			}
+		}
+	}
+	if err := actualRows.Err(); err != nil {
+		actualRows.Close()
+		return report, err
+	}
+	if err := actualRows.Close(); err != nil {
+		return report, err
+	}
+
+	quotaRows, err := s.db.QueryContext(ctx, `
+		SELECT r.client_id, r.deployment_id, q.payload_json
+		FROM run_quota_observations q JOIN runs r ON r.id = q.run_id
+		WHERE r.status = 'completed' AND q.observed_at >= ? AND q.observed_at < ?
+		ORDER BY q.observed_at`, report.Since, report.Until)
+	if err != nil {
+		return report, err
+	}
+	type quotaObservation struct {
+		LimitID string   `json:"limit_id"`
+		Unit    string   `json:"unit"`
+		Before  *float64 `json:"before"`
+		After   *float64 `json:"after"`
+		Delta   *float64 `json:"delta"`
+		Status  string   `json:"status"`
+	}
+	for quotaRows.Next() {
+		var clientID, deploymentID string
+		var payload []byte
+		if err := quotaRows.Scan(&clientID, &deploymentID, &payload); err != nil {
+			quotaRows.Close()
+			return report, err
+		}
+		providerID := filter.ProviderByDeployment[deploymentID]
+		if providerID == "" {
+			providerID = "unknown"
+		}
+		if !reportRunMatches(filter, clientID, providerID) {
+			continue
+		}
+		groupID := providerID
+		if filter.GroupBy == "client" {
+			groupID = clientID
+		}
+		bucket := ensureReportBucket(buckets, groupID)
+		model := ensureReportModel(bucket, deploymentID, providerID)
+		var observations []quotaObservation
+		if err := json.Unmarshal(payload, &observations); err != nil {
+			continue
+		}
+		for _, observation := range observations {
+			addQuota(bucket.quota, providerID, "", observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta)
+			addQuota(model.quota, providerID, deploymentID, observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta)
+		}
+	}
+	if err := quotaRows.Err(); err != nil {
+		quotaRows.Close()
+		return report, err
+	}
+	if err := quotaRows.Close(); err != nil {
+		return report, err
+	}
+
+	report.Groups = renderReportBuckets(buckets)
+	return report, nil
+}
+
+func reportRunMatches(filter UsageReportFilter, clientID, providerID string) bool {
+	return (filter.ClientID == "" || filter.ClientID == clientID) && (filter.ProviderID == "" || filter.ProviderID == providerID)
+}
+
+func ensureReportBucket(buckets map[string]*reportBucket, id string) *reportBucket {
+	if bucket := buckets[id]; bucket != nil {
+		return bucket
+	}
+	bucket := &reportBucket{id: id, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}, quota: map[string]*QuotaTotal{}, models: map[string]*reportModel{}}
+	buckets[id] = bucket
+	return bucket
+}
+
+func ensureReportModel(bucket *reportBucket, deploymentID, providerID string) *reportModel {
+	if model := bucket.models[deploymentID]; model != nil {
+		return model
+	}
+	model := &reportModel{providerID: providerID, runIDs: map[string]struct{}{}, public: map[string]pricing.Decimal{}, actual: map[string]pricing.Decimal{}, quota: map[string]*QuotaTotal{}}
+	bucket.models[deploymentID] = model
+	return model
+}
+
+func addReportDecimal(target map[string]pricing.Decimal, key, raw string) error {
+	value, err := pricing.ParseDecimal(raw)
+	if err != nil {
+		return err
+	}
+	current, exists := target[key]
+	if !exists {
+		current, _ = pricing.ParseDecimal("0")
+	}
+	sum, err := current.Add(value)
+	if err != nil {
+		return err
+	}
+	target[key] = sum
+	return nil
+}
+
+func addQuota(target map[string]*QuotaTotal, providerID, deploymentID, limitID, unit, status string, before, after, delta *float64) {
+	key := providerID + "\x00" + deploymentID + "\x00" + limitID + "\x00" + unit
+	item := target[key]
+	if item == nil {
+		item = &QuotaTotal{ProviderID: providerID, DeploymentID: deploymentID, LimitID: limitID, Unit: unit, Status: status}
+		target[key] = item
+	}
+	item.Observations++
+	item.Status = status
+	item.LatestBefore = before
+	item.LatestAfter = after
+	if status == "observed" && delta != nil {
+		item.Delta += *delta
+	}
+}
+
+func renderReportBuckets(buckets map[string]*reportBucket) []UsageGroup {
+	ids := make([]string, 0, len(buckets))
+	for id := range buckets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	groups := make([]UsageGroup, 0, len(ids))
+	for _, id := range ids {
+		bucket := buckets[id]
+		group := UsageGroup{ID: id, Runs: int64(len(bucket.runIDs)), InputTokens: bucket.inputTokens, OutputTokens: bucket.outputTokens, PublicTotals: renderUnitTotals(bucket.public), ActualTotals: renderActualTotals(bucket.actual), QuotaTotals: renderQuotaTotals(bucket.quota)}
+		modelIDs := make([]string, 0, len(bucket.models))
+		for modelID := range bucket.models {
+			modelIDs = append(modelIDs, modelID)
+		}
+		sort.Strings(modelIDs)
+		for _, modelID := range modelIDs {
+			model := bucket.models[modelID]
+			group.Models = append(group.Models, ModelUsageRow{DeploymentID: modelID, ProviderID: model.providerID, Runs: int64(len(model.runIDs)), InputTokens: model.inputTokens, OutputTokens: model.outputTokens, PublicTotals: renderUnitTotals(model.public), ActualTotals: renderActualTotals(model.actual), QuotaTotals: renderQuotaTotals(model.quota)})
+		}
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+func renderUnitTotals(values map[string]pricing.Decimal) []UnitTotal {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]UnitTotal, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, UnitTotal{Unit: key, Total: values[key].String()})
+	}
+	return result
+}
+
+func renderActualTotals(values map[string]pricing.Decimal) []ActualTotal {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]ActualTotal, 0, len(keys))
+	for _, key := range keys {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 3 {
+			continue
+		}
+		result = append(result, ActualTotal{ProviderID: parts[0], Unit: parts[1], Source: parts[2], Total: values[key].String()})
+	}
+	return result
+}
+
+func renderQuotaTotals(values map[string]*QuotaTotal) []QuotaTotal {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]QuotaTotal, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, *values[key])
+	}
+	return result
+}
+
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -417,6 +796,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_client_created_idx ON runs(client_id, created_at);
 CREATE INDEX IF NOT EXISTS runs_deployment_status_idx ON runs(deployment_id, status);
+CREATE INDEX IF NOT EXISTS runs_status_created_idx ON runs(status, created_at);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     client_id TEXT NOT NULL,
@@ -458,6 +838,7 @@ CREATE TABLE IF NOT EXISTS run_quota_observations (
     observed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS run_quota_observations_run_time_idx ON run_quota_observations(run_id, observed_at);
+CREATE INDEX IF NOT EXISTS run_quota_observations_time_idx ON run_quota_observations(observed_at);
 
 CREATE TABLE IF NOT EXISTS upstream_cost_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -467,6 +848,7 @@ CREATE TABLE IF NOT EXISTS upstream_cost_records (
     observed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS upstream_cost_records_provider_time_idx ON upstream_cost_records(provider_id, observed_at);
+CREATE INDEX IF NOT EXISTS upstream_cost_records_time_idx ON upstream_cost_records(observed_at);
 
 CREATE TABLE IF NOT EXISTS compatibility_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

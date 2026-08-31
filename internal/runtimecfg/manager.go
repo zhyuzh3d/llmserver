@@ -34,8 +34,10 @@ type Manager struct {
 }
 
 type SecretStatus struct {
-	ClientTokens    map[string]bool `json:"client_tokens"`
-	ProviderAPIKeys map[string]bool `json:"provider_api_keys"`
+	ClientTokens     map[string]bool   `json:"client_tokens"`
+	ProviderAPIKeys  map[string]bool   `json:"provider_api_keys"`
+	ClientTokenHints map[string]string `json:"client_token_hints"`
+	ProviderKeyHints map[string]string `json:"provider_api_key_hints"`
 }
 
 type Update struct {
@@ -65,17 +67,32 @@ func (m *Manager) Snapshot() *Snapshot { return m.current.Load() }
 
 func (m *Manager) SecretStatus() SecretStatus {
 	snapshot := m.current.Load()
-	status := SecretStatus{ClientTokens: map[string]bool{}, ProviderAPIKeys: map[string]bool{}}
+	status := SecretStatus{ClientTokens: map[string]bool{}, ProviderAPIKeys: map[string]bool{}, ClientTokenHints: map[string]string{}, ProviderKeyHints: map[string]string{}}
 	if snapshot == nil || snapshot.Secrets == nil {
 		return status
 	}
 	for id, value := range snapshot.Secrets.ClientTokens {
 		status.ClientTokens[id] = value != ""
+		status.ClientTokenHints[id] = maskSecret(value)
 	}
 	for id, value := range snapshot.Secrets.ProviderAPIKeys {
 		status.ProviderAPIKeys[id] = value != ""
+		status.ProviderKeyHints[id] = maskSecret(value)
 	}
 	return status
+}
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		if len(value) <= 4 {
+			return "••••"
+		}
+		return "••••" + value[len(value)-4:]
+	}
+	return value[:4] + "••••••••" + value[len(value)-4:]
 }
 
 func (m *Manager) RevealSecrets() config.SecretConfig {
@@ -160,7 +177,10 @@ func (m *Manager) build(ctx context.Context, cfg *config.Config, secrets *config
 				adapters = append(adapters, unavailableAdapter{id: providerConfig.ID, reason: "provider API key is not configured"})
 				continue
 			}
-			adapter, adapterErr := openaiadapter.New(providerConfig.ID, providerConfig.BaseURL, providerConfig.APIKey, nil)
+			adapter, adapterErr := openaiadapter.NewConfigured(openaiadapter.Config{
+				ProviderID: providerConfig.ID, BaseURL: providerConfig.BaseURL, ResponsesURL: providerConfig.ResponsesURL,
+				APIKey: providerConfig.APIKey, APIKeyHeader: providerConfig.APIKeyHeader, APIKeyPrefix: providerConfig.APIKeyPrefix,
+			}, nil)
 			if adapterErr != nil {
 				return nil, fmt.Errorf("configure provider %s: %w", providerConfig.ID, adapterErr)
 			}

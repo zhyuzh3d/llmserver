@@ -49,6 +49,12 @@ deployments:
 	if !status.ClientTokens["new-device"] || status.ClientTokens["old-device"] {
 		t.Fatalf("secret status = %#v", status.ClientTokens)
 	}
+	if got := status.ClientTokenHints["new-device"]; got != "clie••••••••cret" || strings.Contains(got, "client-secret") {
+		t.Fatalf("client token hint = %q", got)
+	}
+	if got := status.ProviderKeyHints["api"]; got != "prov••••••••cret" || strings.Contains(got, "provider-secret") {
+		t.Fatalf("provider key hint = %q", got)
+	}
 	if manager.Snapshot().Config.Clients[0].ID != "new-device" {
 		t.Fatal("runtime snapshot was not swapped")
 	}

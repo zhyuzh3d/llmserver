@@ -10,39 +10,43 @@
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">L</span>
-        <div><strong>llmserver</strong><small>本机模型网关</small></div>
-      </div>
+      <div class="brand"><span class="brand-mark">L</span><div><strong>llmserver</strong><small>LOCAL CONTROL PLANE</small></div></div>
       <nav aria-label="管理导航">
-        <button class="nav-item active" data-view="overview"><span>概览</span><kbd>1</kbd></button>
-        <button class="nav-item" data-view="providers"><span>供应商</span><kbd>2</kbd></button>
-        <button class="nav-item" data-view="models"><span>模型与定价</span><kbd>3</kbd></button>
-        <button class="nav-item" data-view="usage"><span>消耗统计</span><kbd>4</kbd></button>
-        <button class="nav-item" data-view="access"><span>访问设备</span><kbd>5</kbd></button>
+        <button class="nav-item active" data-view="overview"><span>概览</span><kbd>01</kbd></button>
+        <button class="nav-item" data-view="providers"><span>供应商</span><kbd>02</kbd></button>
+        <button class="nav-item" data-view="platform_usage"><span>平台消耗</span><kbd>03</kbd></button>
+        <button class="nav-item" data-view="access"><span>访问密钥</span><kbd>04</kbd></button>
+        <button class="nav-item" data-view="user_usage"><span>用户消耗</span><kbd>05</kbd></button>
       </nav>
-      <div class="sidebar-note"><i></i><span>仅允许本机访问<br><b id="admin-address">127.0.0.1</b></span></div>
+      <div class="sidebar-note"><i></i><span>管理端仅限本机<br><b id="admin-address">127.0.0.1</b></span></div>
     </aside>
 
     <main>
       <header class="topbar">
-        <div><p class="eyebrow">CONTROL PLANE</p><h1 id="page-title">运行概览</h1></div>
-        <div class="top-actions"><span class="status-pill"><i></i>运行中</span><button class="button primary" id="save-all">保存并生效</button></div>
+        <div><p class="eyebrow">LLMSERVER / ADMIN</p><h1 id="page-title">概览</h1></div>
+        <div class="top-actions"><span class="status-pill"><i></i>服务正常</span><button class="button primary" id="save-all">保存并生效</button></div>
       </header>
       <div id="notice" class="notice" role="status" hidden></div>
-      <section id="content" class="content" aria-live="polite">
-        <div class="loading"><span></span><p>正在读取本机配置…</p></div>
-      </section>
+      <section id="content" class="content" aria-live="polite"><div class="loading"><span></span><p>正在读取配置…</p></div></section>
     </main>
   </div>
 
-  <dialog id="model-dialog">
-    <form method="dialog" class="dialog-card">
-      <header><div><p class="eyebrow">MODEL DISCOVERY</p><h2>选择可用模型</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></header>
+  <dialog id="model-dialog" class="wide-dialog">
+    <div class="dialog-card">
+      <header><div><p class="eyebrow">MODEL CATALOG</p><h2 id="model-dialog-title">供应商模型</h2><p id="model-dialog-caption"></p></div><button class="icon-button" data-close="model-dialog" aria-label="关闭">×</button></header>
       <div id="model-dialog-body" class="dialog-body"></div>
-      <footer><button class="button" value="cancel">取消</button><button type="button" class="button primary" id="apply-models">加入模型配置</button></footer>
-    </form>
+      <footer><button class="button" data-close="model-dialog">取消</button><button type="button" class="button primary" id="apply-models">保存模型设置</button></footer>
+    </div>
   </dialog>
+
+  <dialog id="provider-dialog">
+    <div class="dialog-card">
+      <header><div><p class="eyebrow">PROVIDER SETTINGS</p><h2 id="provider-dialog-title">编辑供应商</h2><p id="provider-dialog-caption"></p></div><button class="icon-button" data-close="provider-dialog" aria-label="关闭">×</button></header>
+      <div id="provider-dialog-body" class="dialog-body"></div>
+      <footer><button class="button danger" id="delete-provider" hidden>删除供应商</button><span class="footer-spacer"></span><button class="button" data-close="provider-dialog">取消</button><button type="button" class="button primary" id="apply-provider">保存供应商</button></footer>
+    </div>
+  </dialog>
+
   <script src="app.js" defer></script>
 </body>
 </html>

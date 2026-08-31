@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,10 @@ type ProviderConfig struct {
 	Type               string      `yaml:"type" json:"type"`
 	DisplayName        string      `yaml:"display_name" json:"display_name"`
 	BaseURL            string      `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	ModelsURL          string      `yaml:"models_url,omitempty" json:"models_url,omitempty"`
+	ResponsesURL       string      `yaml:"responses_url,omitempty" json:"responses_url,omitempty"`
+	APIKeyHeader       string      `yaml:"api_key_header,omitempty" json:"api_key_header,omitempty"`
+	APIKeyPrefix       string      `yaml:"api_key_prefix,omitempty" json:"api_key_prefix,omitempty"`
 	WireAPI            string      `yaml:"wire_api,omitempty" json:"wire_api,omitempty"`
 	Executable         string      `yaml:"executable,omitempty" json:"executable,omitempty"`
 	ExpectedVersion    string      `yaml:"expected_version,omitempty" json:"expected_version,omitempty"`
@@ -277,6 +282,9 @@ func (c *Config) Validate() error {
 			if provider.BaseURL == "" {
 				return fmt.Errorf("provider %q requires base_url", provider.ID)
 			}
+			if err := validateAPIProvider(provider); err != nil {
+				return fmt.Errorf("provider %q: %w", provider.ID, err)
+			}
 		case "codex_exec", "workbuddy_exec":
 			if !filepath.IsAbs(provider.Executable) {
 				return fmt.Errorf("provider %q executable must be an absolute path", provider.ID)
@@ -333,6 +341,25 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("client %q allows unknown deployment %q", client.ID, deploymentID)
 			}
 		}
+	}
+	return nil
+}
+
+func validateAPIProvider(provider ProviderConfig) error {
+	if provider.WireAPI != "" && provider.WireAPI != "responses" {
+		return fmt.Errorf("unsupported wire_api %q", provider.WireAPI)
+	}
+	for label, raw := range map[string]string{"base_url": provider.BaseURL, "models_url": provider.ModelsURL, "responses_url": provider.ResponsesURL} {
+		if raw == "" {
+			continue
+		}
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("%s must be an absolute HTTP URL", label)
+		}
+	}
+	if strings.ContainsAny(provider.APIKeyHeader, "\r\n:") || strings.ContainsAny(provider.APIKeyPrefix, "\r\n") {
+		return errors.New("API key header or prefix is invalid")
 	}
 	return nil
 }

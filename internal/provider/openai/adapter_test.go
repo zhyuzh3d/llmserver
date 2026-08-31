@@ -109,6 +109,33 @@ func TestProviderErrorBodyIsNotReflected(t *testing.T) {
 	}
 }
 
+func TestConfiguredEndpointAndAPIKeyHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/custom/responses" || r.URL.Query().Get("api-version") != "2026-08-31" {
+			t.Fatalf("request URL = %s", r.URL.String())
+		}
+		if r.Header.Get("api-key") != "custom-secret" || r.Header.Get("Authorization") != "" {
+			t.Fatalf("custom API key header was not used")
+		}
+		_, _ = fmt.Fprint(w, `{"id":"resp","model":"upstream","output":[{"content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	adapter, err := NewConfigured(Config{
+		ProviderID: "api", BaseURL: upstream.URL, ResponsesURL: upstream.URL + "/custom/responses?api-version=2026-08-31",
+		APIKey: config.NewSecret("custom-secret"), APIKeyHeader: "api-key", APIKeyPrefix: "none",
+	}, upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := adapter.Start(context.Background(), provider.Request{UpstreamModel: "upstream", RawRequest: json.RawMessage(`{"model":"public","input":"ok"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final := completedEvent(t, events); final.OutputText != "ok" {
+		t.Fatalf("output = %q", final.OutputText)
+	}
+}
+
 func completedEvent(t *testing.T, events <-chan provider.Event) *provider.Final {
 	t.Helper()
 	for event := range events {
