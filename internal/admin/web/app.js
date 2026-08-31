@@ -33,6 +33,19 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const providerType = type => type === "openai_responses" ? "API 供应商" : "系统供应商";
 const providerName = id => byID(state.config.providers, id)?.display_name || id;
 const secretHint = (kind, id) => kind === "provider" ? state.secretStatus.provider_api_key_hints?.[id] : state.secretStatus.client_token_hints?.[id];
+const fixedDecimal = (value, digits) => {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number.toFixed(digits) : Number(0).toFixed(digits);
+};
+
+function normalizedPrice(value, label) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    showNotice(`${label}必须是非负数字。`, true);
+    return null;
+  }
+  return number.toFixed(2);
+}
 
 function showNotice(message, error = false) {
   notice.textContent = message;
@@ -120,7 +133,7 @@ function renderOverview() {
 
 function enabledModelTable(models) {
   if (!models.length) return `<div class="empty-state">还没有启用模型</div>`;
-  return `<div class="table-card"><table><thead><tr><th>公开模型</th><th>供应商</th><th>上游模型</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th></tr></thead><tbody>${models.map(item => `<tr><td><strong>${escapeHTML(item.id)}</strong></td><td>${escapeHTML(providerName(item.provider_id))}</td><td><code>${escapeHTML(item.upstream_model)}</code></td><td>${escapeHTML(item.price.currency)} ${escapeHTML(item.price.input_per_million)}</td><td>${escapeHTML(item.price.currency)} ${escapeHTML(item.price.output_per_million)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-card"><table><thead><tr><th>公开模型</th><th>供应商</th><th>上游模型</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th></tr></thead><tbody>${models.map(item => `<tr><td><strong>${escapeHTML(item.id)}</strong></td><td>${escapeHTML(providerName(item.provider_id))}</td><td><code>${escapeHTML(item.upstream_model)}</code></td><td>${escapeHTML(item.price.currency)} ${fixedDecimal(item.price.input_per_million, 2)}</td><td>${escapeHTML(item.price.currency)} ${fixedDecimal(item.price.output_per_million, 2)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function providerCards(providers, editable) {
@@ -190,8 +203,8 @@ function renderProviderDialog() {
       ${isAPI ? apiProviderFields(provider) : systemProviderFields(provider)}
       <div class="form-section"><h3>新模型默认平台价</h3><p>刷新模型时作为初始值，之后每个模型可以独立修改。</p></div>
       <label class="field"><span>货币</span><input data-default-field="currency" value="${escapeHTML(provider.default_public_price?.currency || "USD")}"></label>
-      <label class="field"><span>输入 / 1M Token</span><input data-default-field="input_per_million" value="${escapeHTML(provider.default_public_price?.input_per_million || "0.000000")}"></label>
-      <label class="field"><span>输出 / 1M Token</span><input data-default-field="output_per_million" value="${escapeHTML(provider.default_public_price?.output_per_million || "0.000000")}"></label>
+      <label class="field"><span>输入 / 1M Token</span><input data-default-field="input_per_million" value="${fixedDecimal(provider.default_public_price?.input_per_million, 2)}"></label>
+      <label class="field"><span>输出 / 1M Token</span><input data-default-field="output_per_million" value="${fixedDecimal(provider.default_public_price?.output_per_million, 2)}"></label>
     </div>`;
   const deleteButton = document.querySelector("#delete-provider");
   deleteButton.hidden = isNew || !isAPI;
@@ -227,6 +240,11 @@ async function applyProvider() {
   });
   provider.default_public_price ||= {};
   document.querySelectorAll("[data-default-field]").forEach(input => provider.default_public_price[input.dataset.defaultField] = input.value.trim());
+  const defaultInput = normalizedPrice(provider.default_public_price.input_per_million, "默认输入价格");
+  const defaultOutput = normalizedPrice(provider.default_public_price.output_per_million, "默认输出价格");
+  if (defaultInput === null || defaultOutput === null) return;
+  provider.default_public_price.input_per_million = defaultInput;
+  provider.default_public_price.output_per_million = defaultOutput;
   provider.default_public_price.revision = `${provider.id}-default-${Date.now()}`;
   provider.default_public_price.source = "configured";
   if (!provider.id || byID(state.config.providers.filter((_, index) => index !== draft.index), provider.id)) {
@@ -277,25 +295,51 @@ function renderModelDialog(provider) {
   document.querySelector("#model-dialog-title").textContent = `${provider.display_name || provider.id} · 模型设置`;
   document.querySelector("#model-dialog-caption").textContent = "取消勾选会立即停用已有模型；未被本次目录发现的既有模型仍保留在列表末尾。";
   const defaults = provider.default_public_price || { currency: "USD", input_per_million: "0", output_per_million: "0" };
-  document.querySelector("#model-dialog-body").innerHTML = `<div class="model-table-wrap"><table class="model-table"><thead><tr><th>启用</th><th>供应商模型</th><th>公开模型 ID</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th><th>实际口径</th><th>单位</th><th>实际输入 / 1M</th><th>实际输出 / 1M</th></tr></thead><tbody>${state.modelRows.map((row, index) => modelDialogRow(row, index, defaults)).join("")}</tbody></table></div>`;
+  const multiplierHeader = provider.type === "workbuddy_exec" ? "<th>积分倍率</th>" : "";
+  document.querySelector("#model-dialog-body").innerHTML = `<div class="model-table-wrap"><table class="model-table ${provider.type}"><thead><tr><th>启用</th><th>供应商模型</th>${multiplierHeader}<th>公开模型 ID</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th><th>实际口径</th><th>单位</th><th>实际输入 / 1M</th><th>实际输出 / 1M</th></tr></thead><tbody>${state.modelRows.map((row, index) => modelDialogRow(row, index, defaults, provider)).join("")}</tbody></table></div>`;
+  document.querySelectorAll("[data-model-row]").forEach(element => {
+    element.querySelector(".actual-kind")?.addEventListener("change", () => syncActualControls(element));
+    syncActualControls(element);
+  });
   modelDialog.showModal();
 }
 
-function modelDialogRow(row, index, defaults) {
+function modelDialogRow(row, index, defaults, provider) {
   const deployment = row.deployment;
   const actualKind = deployment?.actual_price ? "currency" : deployment?.actual_points ? "points" : "none";
   const actual = deployment?.actual_price || deployment?.actual_points || {};
+  const multiplier = provider.type === "workbuddy_exec" ? `<td class="credit-multiplier">${row.model.credit_multiplier ? `× ${fixedDecimal(row.model.credit_multiplier, 2)}` : row.model.id === "auto" ? "动态" : "未公布"}</td>` : "";
+  let actualFields = `<td><select class="compact actual-kind"><option value="none" ${actualKind === "none" ? "selected" : ""}>不记录</option><option value="currency" ${actualKind === "currency" ? "selected" : ""}>货币</option><option value="points" ${actualKind === "points" ? "selected" : ""}>积分</option></select></td>
+    <td><input class="compact actual-unit" value="${escapeHTML(deployment?.actual_price?.currency || (actualKind === "points" ? "POINTS" : "USD"))}"></td>
+    <td><input class="compact actual-input" value="${fixedDecimal(actual.input_per_million, 2)}"></td>
+    <td><input class="compact actual-output" value="${fixedDecimal(actual.output_per_million, 2)}"></td>`;
+  if (provider.type === "codex_exec") {
+    actualFields = `<td><select class="compact actual-kind" disabled><option value="quota">周额度百分比</option></select></td><td><input class="compact actual-unit" value="%" disabled></td><td><input class="compact actual-input" value="自动观测" disabled></td><td><input class="compact actual-output" value="自动观测" disabled></td>`;
+  } else if (provider.type === "workbuddy_exec") {
+    actualFields = `<td><select class="compact actual-kind" disabled><option value="reported_points">积分实报</option></select></td><td><input class="compact actual-unit" value="POINTS" disabled></td><td><input class="compact actual-input" value="实际值" disabled></td><td><input class="compact actual-output" value="实际值" disabled></td>`;
+  }
   return `<tr data-model-row="${index}">
     <td><input type="checkbox" class="model-enabled" ${deployment?.enabled ? "checked" : ""}></td>
     <td><strong>${escapeHTML(row.model.display_name || row.model.id)}</strong><small>${escapeHTML(row.model.id)}${row.discovered ? "" : " · 本次未发现"}</small></td>
+    ${multiplier}
     <td><input class="compact public-id" value="${escapeHTML(deployment?.id || row.model.id)}"></td>
-    <td><input class="compact public-input" value="${escapeHTML(deployment?.price?.input_per_million || defaults.input_per_million)}"></td>
-    <td><input class="compact public-output" value="${escapeHTML(deployment?.price?.output_per_million || defaults.output_per_million)}"></td>
-    <td><select class="compact actual-kind"><option value="none" ${actualKind === "none" ? "selected" : ""}>不记录</option><option value="currency" ${actualKind === "currency" ? "selected" : ""}>货币</option><option value="points" ${actualKind === "points" ? "selected" : ""}>积分</option></select></td>
-    <td><input class="compact actual-unit" value="${escapeHTML(deployment?.actual_price?.currency || (actualKind === "points" ? "POINTS" : "USD"))}"></td>
-    <td><input class="compact actual-input" value="${escapeHTML(actual.input_per_million || "0.000000")}"></td>
-    <td><input class="compact actual-output" value="${escapeHTML(actual.output_per_million || "0.000000")}"></td>
+    <td><input class="compact price-input public-input" value="${fixedDecimal(deployment?.price?.input_per_million || defaults.input_per_million, 2)}"></td>
+    <td><input class="compact price-input public-output" value="${fixedDecimal(deployment?.price?.output_per_million || defaults.output_per_million, 2)}"></td>
+    ${actualFields}
   </tr>`;
+}
+
+function syncActualControls(element) {
+  const selector = element.querySelector(".actual-kind");
+  const kind = selector?.value;
+  const unit = element.querySelector(".actual-unit");
+  const inputs = [element.querySelector(".actual-input"), element.querySelector(".actual-output")];
+  if (!unit || !inputs[0]) return;
+  if (selector.disabled) return;
+  unit.disabled = kind !== "currency";
+  inputs.forEach(input => input.disabled = kind === "none");
+  if (kind === "points") unit.value = "POINTS";
+  if (kind === "currency" && (!unit.value || unit.value === "POINTS")) unit.value = "USD";
 }
 
 async function applyModels() {
@@ -308,9 +352,12 @@ async function applyModels() {
     if (!row.deployment && !enabled) continue;
     const id = element.querySelector(".public-id").value.trim();
     if (!id) return showNotice("公开模型 ID 不能为空。", true);
+    const publicInput = normalizedPrice(element.querySelector(".public-input").value.trim(), `${id} 平台输入价格`);
+    const publicOutput = normalizedPrice(element.querySelector(".public-output").value.trim(), `${id} 平台输出价格`);
+    if (publicInput === null || publicOutput === null) return;
     const price = {
       revision: `${id}-public-${Date.now()}`, currency: provider.default_public_price?.currency || "USD",
-      input_per_million: element.querySelector(".public-input").value.trim(), output_per_million: element.querySelector(".public-output").value.trim(), source: "configured",
+      input_per_million: publicInput, output_per_million: publicOutput, source: "configured",
     };
     const deployment = row.deployment || {
       id, provider_id: provider.id, upstream_model: row.model.id,
@@ -321,13 +368,16 @@ async function applyModels() {
     deployment.price = price;
     delete deployment.actual_price;
     delete deployment.actual_points;
-    const actualKind = element.querySelector(".actual-kind").value;
-    const actualInput = element.querySelector(".actual-input").value.trim();
-    const actualOutput = element.querySelector(".actual-output").value.trim();
-    if (actualKind === "currency") {
-      deployment.actual_price = { revision: `${id}-actual-${Date.now()}`, currency: element.querySelector(".actual-unit").value.trim().toUpperCase() || "USD", input_per_million: actualInput, output_per_million: actualOutput, source: "configured_estimate" };
-    } else if (actualKind === "points") {
-      deployment.actual_points = { input_per_million: actualInput, output_per_million: actualOutput, source: "configured_estimate" };
+    const actualKind = element.querySelector(".actual-kind")?.value;
+    if (provider.type === "openai_responses" && (actualKind === "currency" || actualKind === "points")) {
+      const actualInput = normalizedPrice(element.querySelector(".actual-input").value, `${id} 实际输入价格`);
+      const actualOutput = normalizedPrice(element.querySelector(".actual-output").value, `${id} 实际输出价格`);
+      if (actualInput === null || actualOutput === null) return;
+      if (actualKind === "currency") {
+        deployment.actual_price = { revision: `${id}-actual-${Date.now()}`, currency: element.querySelector(".actual-unit").value.trim().toUpperCase() || "USD", input_per_million: actualInput, output_per_million: actualOutput, source: "configured_estimate" };
+      } else {
+        deployment.actual_points = { input_per_million: actualInput, output_per_million: actualOutput, source: "configured_estimate" };
+      }
     }
     proposed.push({ row, deployment });
   }
@@ -508,34 +558,52 @@ function usageReport(groupBy, report, selected) {
 
 function usageSummaryCard(groupBy, group) {
   const title = groupBy === "provider" ? providerName(group.id) : group.id;
-  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3>${escapeHTML(title)}</h3></div><strong>${group.runs}</strong></header><div class="usage-kpis"><div><span>平台价消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际供应商消耗</span><b>${formatActual(group.actual_totals, group.quota_totals, groupBy === "client")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 输入 · ${Number(group.output_tokens).toLocaleString()} 输出</footer></article>`;
+  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3>${escapeHTML(title)}</h3></div><strong>${group.runs}</strong></header><div class="usage-kpis"><div><span>平台价消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际供应商消耗</span><b>${formatActual(group.actual_totals, group.quota_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 输入 · ${Number(group.output_tokens).toLocaleString()} 输出</footer></article>`;
 }
 
 function usageModelsTable(groupBy, rows) {
   if (!rows.length) return `<div class="empty-state">所选时间范围内没有消耗</div>`;
-  return `<div class="table-card"><table><thead><tr>${groupBy === "client" ? "<th>访问密钥</th>" : ""}<th>模型</th><th>供应商</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>平台价消耗</th><th>实际供应商消耗</th></tr></thead><tbody>${rows.map(row => `<tr>${groupBy === "client" ? `<td><code>${escapeHTML(row.group_id)}</code></td>` : ""}<td><strong>${escapeHTML(row.deployment_id)}</strong></td><td>${escapeHTML(providerName(row.provider_id))}</td><td>${row.runs}</td><td>${Number(row.input_tokens).toLocaleString()}</td><td>${Number(row.output_tokens).toLocaleString()}</td><td>${formatUnitTotals(row.public_totals)}</td><td>${formatActual(row.actual_totals, row.quota_totals)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-card"><table><thead><tr>${groupBy === "client" ? "<th>访问密钥</th>" : ""}<th>模型</th><th>供应商</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>平台价消耗</th><th>实际供应商消耗</th></tr></thead><tbody>${rows.map(row => `<tr>${groupBy === "client" ? `<td><code>${escapeHTML(row.group_id)}</code></td>` : ""}<td><strong>${escapeHTML(row.deployment_id)}</strong></td><td>${escapeHTML(providerName(row.provider_id))}</td><td>${row.runs}</td><td>${Number(row.input_tokens).toLocaleString()}</td><td>${Number(row.output_tokens).toLocaleString()}</td><td>${formatUnitTotals(row.public_totals)}</td><td>${formatActual(row.actual_totals, row.quota_totals, false, row.provider_id)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function formatUnitTotals(items = []) {
   if (!items.length) return `<span class="muted">—</span>`;
-  return items.map(item => `<span class="amount">${escapeHTML(item.unit)} ${escapeHTML(prettyDecimal(item.total))}</span>`).join(" ");
+  return items.map(item => `<span class="amount">${escapeHTML(item.unit)} ${fixedDecimal(item.total, 4)}</span>`).join(" ");
 }
 
-function formatActual(actual = [], quota = [], showProvider = false) {
-  const prefix = item => showProvider ? `${escapeHTML(providerName(item.provider_id))} · ` : "";
-  const values = actual.map(item => `<span class="amount ${item.source === "provider_reported" ? "reported" : "estimated"}">${prefix(item)}${escapeHTML(item.unit)} ${escapeHTML(prettyDecimal(item.total))}<small>${item.source === "provider_reported" ? "实报" : "估算"}</small></span>`);
-  for (const item of quota) {
-    const suffix = item.status === "observed" ? `Δ ${Number(item.delta).toFixed(2)}%` : item.status;
-    values.push(`<span class="amount quota">${prefix(item)}${escapeHTML(item.limit_id)} ${escapeHTML(suffix)}<small>额度</small></span>`);
+function formatActual(actual = [], quota = [], showProvider = false, fixedProviderID = "") {
+  const providerIDs = new Set([fixedProviderID, ...actual.map(item => item.provider_id), ...quota.map(item => item.provider_id)].filter(Boolean));
+  const values = [];
+  for (const providerID of providerIDs) {
+    const provider = byID(state.config.providers, providerID);
+    const prefix = showProvider ? `${escapeHTML(providerName(providerID))} · ` : "";
+    const providerActual = actual.filter(item => item.provider_id === providerID);
+    const providerQuota = quota.filter(item => item.provider_id === providerID);
+    if (provider?.type === "codex_exec") {
+      const weekly = providerQuota.filter(item => item.status === "observed" && Number(item.window_duration_minutes) >= 6 * 24 * 60 && Number(item.window_duration_minutes) <= 8 * 24 * 60);
+      const selected = weekly.find(item => item.limit_id === "codex:primary") || weekly.sort((a, b) => Number(b.latest_after || 0) - Number(a.latest_after || 0))[0];
+      if (selected) {
+        values.push(`<span class="amount quota">${prefix}周额度已用 ${Number(selected.latest_after || 0).toFixed(2)}%<small>时段变化 ${Number(selected.delta || 0).toFixed(4)}%</small></span>`);
+      } else if (providerQuota.length) {
+        values.push(`<span class="amount quota unavailable">${prefix}周额度暂不可比较</span>`);
+      }
+      continue;
+    }
+    if (provider?.type === "workbuddy_exec") {
+      const points = providerActual.filter(item => String(item.unit).toUpperCase() === "POINTS");
+      for (const item of points) {
+        values.push(`<span class="amount ${item.source === "provider_reported" ? "reported" : "estimated"}">${prefix}积分 ${fixedDecimal(item.total, 4)}<small>${item.source === "provider_reported" ? "实报" : "估算"}</small></span>`);
+      }
+      if (!points.length && providerActual.length) {
+        values.push(`<span class="amount unavailable">${prefix}历史记录无积分</span>`);
+      }
+      continue;
+    }
+    for (const item of providerActual) {
+      values.push(`<span class="amount ${item.source === "provider_reported" ? "reported" : "estimated"}">${prefix}${escapeHTML(item.unit)} ${fixedDecimal(item.total, 4)}<small>${item.source === "provider_reported" ? "实报" : "估算"}</small></span>`);
+    }
   }
   return values.length ? values.join(" ") : `<span class="muted">未提供</span>`;
-}
-
-function prettyDecimal(raw) {
-  const text = String(raw ?? "0");
-  if (!text.includes(".")) return text;
-  const trimmed = text.replace(/0+$/, "").replace(/\.$/, "");
-  return trimmed || "0";
 }
 
 function formatRange(since, until) {

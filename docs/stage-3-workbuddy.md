@@ -228,4 +228,4 @@ WorkBuddy/CodeBuddy 可能具备文件、shell、PTY、进程、MCP、插件和 
 - permission 或 agent tool 事件被明确拒绝；
 - 模拟安全套件确认无文件、进程、网络、Keychain、MCP、插件或 GUI 副作用；
 - 全套测试离线通过；
-- 发布说明明确：未调用 Hominal；真实 smoke 只证明测试时的当前登录态、实时模型和 token usage 可用。当前 CLI 结果没有可验证的剩余额度快照，因此 WorkBuddy quota 暂不返回，不能拿 `total_cost_usd` 或公开价格反推。
+- 发布说明明确：未调用 Hominal；真实 smoke 只证明测试时的当前登录态、实时模型、token usage 和本次 `rawUsage.credit` 可用。当前仍没有可验证的剩余积分余额快照，因此 WorkBuddy quota 暂不返回；模型积分倍率只作目录信息展示，不能拿倍率、`total_cost_usd` 或公开价格反推余额。

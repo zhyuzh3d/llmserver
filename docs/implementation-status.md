@@ -24,7 +24,7 @@ Stage 1 结算主链、Stage 2 Codex Adapter、Stage 3 WorkBuddy Adapter和本�
 - SQLite 记录 accepted/running/completed/failed、usage 来源、公开价格快照、金额、幂等和崩溃恢复；
 - 供应商结构化 cost/total_cost 作为 `provider_reported` 单独入库；未实报时可用 `actual_price` / `actual_points` 作为 `configured_estimate`；两者均不改变调用方费用；
 - Codex 经 App Server 读取多个 rate-limit 窗口并单独入库；只有设备策略开启时才向调用方返回；
-- WorkBuddy 记录 CLI 实报 `total_cost_usd`；当前版本没有可靠积分余额接口，不伪造积分实报；
+- WorkBuddy 使用请求专属 session ID，从本机会话 `rawUsage.credit` 读取本次实际积分，并从本机动态产品目录读取模型积分倍率；只解析白名单字段，不返回目录中的其他本机数据；
 - 管理端限制回环来源、拒绝跨站修改请求，并设置 CSP、禁止 iframe 与 no-store；
 - `launchctl submit` 常驻脚本使用清洁环境启动，不把调用任务中的无关 Token 继承到服务进程；异常退出由 launchd 拉起，系统重启后需手工重新注册。
 
@@ -33,7 +33,7 @@ Stage 1 结算主链、Stage 2 Codex Adapter、Stage 3 WorkBuddy Adapter和本�
 - 标准 API、Codex、WorkBuddy 均成功刷新当前可用模型；分别返回 10、7、15 个模型；
 - `luna` 返回 `OK`，公开结算确认，输入 4685 Token、输出 5 Token、总价 `0.000943000 USD`；
 - `codex-luna` 返回 `OK`，公开结算确认，输入 12777 Token、输出 5 Token、总价 `0.002561400 USD`；额度快照已入库且默认不向调用方返回；
-- `workbuddy-hy4-preview` 返回 `OK`，公开结算确认，输入 3096 Token、输出 57 Token、总价 `0.006876000 USD`；CLI 实报美元成本已进入独立实际消耗表；
+- `workbuddy-hy4-preview` 返回 `OK`，公开结算确认；最新受控请求输入 3096 Token、输出 51 Token、总价 `0.006804000 USD`，本机会话实报 `0.000000000 POINTS` 已进入实际消耗表（当前 Hy4 限时积分倍率为 0）；
 - 管理页、状态接口、按供应商和按访问密钥的时间窗消耗汇总接口返回 200；普通状态响应与常驻进程环境均未包含完整配置秘密值；伪造跨站修改请求返回 403；
 - API 监听所有本机接口，管理台只监听 IPv4 loopback；
 - 自动测试覆盖配置分离、密钥掩码、配置热更新、访问密钥改名 Token 迁移、模型发现、自定义端点/鉴权、管理端来源限制、按供应商/访问密钥的公开/实际/额度时间窗汇总、鉴权、金额、SSE、取消、幂等和数据库恢复。
@@ -43,7 +43,7 @@ Stage 1 结算主链、Stage 2 Codex Adapter、Stage 3 WorkBuddy Adapter和本�
 - `/v1/chat/completions`、function tools、结构化输出和完整 OpenAI API 覆盖；
 - 客户端每分钟速率、并发队列、来源 IP allowlist 和更细输入/输出限制；
 - 内建 TLS。当前 LAN 监听只适用于可信隔离网络；不可信网络必须增加 HTTPS/mTLS、VPN 或零信任入口；
-- WorkBuddy 积分余额或积分变化的供应商实报；后台积分费率只能作为配置估算；
+- WorkBuddy 剩余积分余额接口；当前能证明每次请求的实际积分消耗，但不能据此构造账户余额；
 - soft budget 中途取消和 overshoot 上限；
 - Standard API 全部供应商私有 cost 格式。当前仅解析安全、结构化的常见 `cost` / `total_cost` 形态；
 - 配置两个 YAML 之间的跨文件崩溃事务。每个文件独立原子替换，运行快照只在两者均保存成功后切换，但操作系统在两次 rename 之间断电仍不是分布式原子事务；

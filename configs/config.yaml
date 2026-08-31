@@ -17,13 +17,13 @@ clients:
 providers:
     - id: api-openai
       type: openai_responses
-      display_name: OpenAI-compatible API
+      display_name: AImesh-OpenAI
       base_url: https://ai.ai-mesh.cn
-      wire_api: responses
       api_key_header: Authorization
       api_key_prefix: Bearer
+      wire_api: responses
       default_public_price:
-        revision: api-default-public-v1
+        revision: api-openai-default-1788154108633
         currency: USD
         input_per_million: "2.000000"
         output_per_million: "12.000000"

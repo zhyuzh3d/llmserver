@@ -325,15 +325,17 @@ type ActualTotal struct {
 }
 
 type QuotaTotal struct {
-	ProviderID   string   `json:"provider_id"`
-	DeploymentID string   `json:"deployment_id,omitempty"`
-	LimitID      string   `json:"limit_id"`
-	Unit         string   `json:"unit"`
-	Delta        float64  `json:"delta"`
-	LatestBefore *float64 `json:"latest_before,omitempty"`
-	LatestAfter  *float64 `json:"latest_after,omitempty"`
-	Observations int64    `json:"observations"`
-	Status       string   `json:"status"`
+	ProviderID            string   `json:"provider_id"`
+	DeploymentID          string   `json:"deployment_id,omitempty"`
+	LimitID               string   `json:"limit_id"`
+	Unit                  string   `json:"unit"`
+	Delta                 float64  `json:"delta"`
+	LatestBefore          *float64 `json:"latest_before,omitempty"`
+	LatestAfter           *float64 `json:"latest_after,omitempty"`
+	WindowDurationMinutes *int64   `json:"window_duration_minutes,omitempty"`
+	ResetsAt              *int64   `json:"resets_at,omitempty"`
+	Observations          int64    `json:"observations"`
+	Status                string   `json:"status"`
 }
 
 func (s *SQLite) UsageSummary(ctx context.Context) (UsageSummary, error) {
@@ -604,12 +606,14 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 		return report, err
 	}
 	type quotaObservation struct {
-		LimitID string   `json:"limit_id"`
-		Unit    string   `json:"unit"`
-		Before  *float64 `json:"before"`
-		After   *float64 `json:"after"`
-		Delta   *float64 `json:"delta"`
-		Status  string   `json:"status"`
+		LimitID               string   `json:"limit_id"`
+		Unit                  string   `json:"unit"`
+		Before                *float64 `json:"before"`
+		After                 *float64 `json:"after"`
+		Delta                 *float64 `json:"delta"`
+		WindowDurationMinutes *int64   `json:"window_duration_minutes"`
+		ResetsAt              *int64   `json:"resets_at"`
+		Status                string   `json:"status"`
 	}
 	for quotaRows.Next() {
 		var clientID, deploymentID string
@@ -636,8 +640,8 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 			continue
 		}
 		for _, observation := range observations {
-			addQuota(bucket.quota, providerID, "", observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta)
-			addQuota(model.quota, providerID, deploymentID, observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta)
+			addQuota(bucket.quota, providerID, "", observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta, observation.WindowDurationMinutes, observation.ResetsAt)
+			addQuota(model.quota, providerID, deploymentID, observation.LimitID, observation.Unit, observation.Status, observation.Before, observation.After, observation.Delta, observation.WindowDurationMinutes, observation.ResetsAt)
 		}
 	}
 	if err := quotaRows.Err(); err != nil {
@@ -691,7 +695,7 @@ func addReportDecimal(target map[string]pricing.Decimal, key, raw string) error 
 	return nil
 }
 
-func addQuota(target map[string]*QuotaTotal, providerID, deploymentID, limitID, unit, status string, before, after, delta *float64) {
+func addQuota(target map[string]*QuotaTotal, providerID, deploymentID, limitID, unit, status string, before, after, delta *float64, windowDurationMinutes, resetsAt *int64) {
 	key := providerID + "\x00" + deploymentID + "\x00" + limitID + "\x00" + unit
 	item := target[key]
 	if item == nil {
@@ -702,6 +706,8 @@ func addQuota(target map[string]*QuotaTotal, providerID, deploymentID, limitID, 
 	item.Status = status
 	item.LatestBefore = before
 	item.LatestAfter = after
+	item.WindowDurationMinutes = windowDurationMinutes
+	item.ResetsAt = resetsAt
 	if status == "observed" && delta != nil {
 		item.Delta += *delta
 	}

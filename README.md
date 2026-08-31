@@ -89,7 +89,7 @@ scripts/llmserver-service stop
 
 仅有 Base URL 只足以覆盖采用标准 `/v1/models`、`/v1/responses` 和 `Authorization: Bearer` 的兼容供应商。对于路径或鉴权不同但请求协议仍兼容的 API，可在供应商编辑弹窗设置完整 Models URL、完整 Responses URL、Key Header 和 Key Prefix（无前缀填写 `none`）。需要额外签名、动态 Header、私有请求体或只支持 Chat Completions 的供应商仍应实现独立 Adapter，不能用 Base URL 配置伪装成已兼容。
 
-Codex 能读取当前账号的多个限额窗口。WorkBuddy 当前 CLI 会实报 `total_cost_usd`，但没有提供积分余额接口；因此管理台会记录实报美元成本，积分只能明确标记为配置估算，不能伪装成供应商实报。
+Codex 会自动记录可比较的周额度窗口，管理台只展示友好的“周额度已用/时段变化”，不显示内部 limit ID、`window_changed` 或 `unavailable` 状态码。WorkBuddy 会从本次会话的 `rawUsage.credit` 记录实际积分，并从本机动态产品目录显示模型积分倍率；倍率是计费系数，不等于本次实际积分。当前仍没有可靠的 WorkBuddy 剩余积分余额接口。
 
 ## 局域网边界
 

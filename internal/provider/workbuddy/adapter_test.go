@@ -58,6 +58,40 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"WORKBUDDY_
 	}
 }
 
+func TestAdapterPrefersSessionCreditOverUSD(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	executable := fakeWorkBuddy(t, `
+if [ "$1" = "--version" ]; then echo '2.115.0-test'; exit 0; fi
+session=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--session-id" ]; then shift; session="$1"; fi
+  shift
+done
+project=$(pwd -P | sed 's#^/##; s#/#-#g')
+mkdir -p "$HOME/.codebuddy/projects/$project"
+printf '%s\n' '{"providerData":{"rawUsage":{"credit":1.25}}}' > "$HOME/.codebuddy/projects/$project/$session.jsonl"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"OK","total_cost_usd":999,"usage":{"input_tokens":10,"output_tokens":2}}'
+`)
+	adapter, err := New(Config{ProviderID: "workbuddy", Executable: executable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := adapter.Start(context.Background(), provider.Request{RunID: "req_points", UpstreamModel: "hy4-preview", CanonicalInput: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final *provider.Final
+	for event := range events {
+		if event.Type == provider.EventCompleted {
+			final = event.Final
+		}
+	}
+	if final == nil || len(final.Costs) != 1 || final.Costs[0].Unit != "POINTS" || final.Costs[0].Total != "1.250000000" {
+		t.Fatalf("final = %#v", final)
+	}
+}
+
 func TestAdapterFailsClosedOnToolUse(t *testing.T) {
 	executable := fakeWorkBuddy(t, `
 if [ "$1" = "--version" ]; then echo '2.115.0'; exit 0; fi
@@ -108,6 +142,19 @@ sleep 30
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelled WorkBuddy process group did not stop")
+	}
+}
+
+func TestReadSessionCreditFileUsesReportedPoints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	contents := "{\"type\":\"message\",\"providerData\":{\"rawUsage\":{\"credit\":0.79}}}\n" +
+		"{\"type\":\"message\",\"providerData\":{\"rawUsage\":{\"credit\":1.25}}}\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credit, found := readSessionCreditFile(path)
+	if !found || credit != "1.250000000" {
+		t.Fatalf("credit=%q found=%t", credit, found)
 	}
 }
 

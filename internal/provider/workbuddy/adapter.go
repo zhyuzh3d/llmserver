@@ -74,9 +74,11 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 		"--setting-sources", "",
 		"--permission-mode", "dontAsk",
 		"--max-turns", "1",
-		"--model", request.UpstreamModel,
-		"--system-prompt", systemPrompt,
 	)
+	if request.RunID != "" {
+		args = append(args, "--session-id", request.RunID)
+	}
+	args = append(args, "--model", request.UpstreamModel, "--system-prompt", systemPrompt)
 	command := exec.CommandContext(ctx, a.config.Executable, args...)
 	command.Dir = runDir
 	command.Stdin = strings.NewReader(request.CanonicalInput)
@@ -107,12 +109,12 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 		defer close(events)
 		defer func() { <-a.slot }()
 		defer os.RemoveAll(runDir)
-		consume(ctx, stdout, command, request.UpstreamModel, events)
+		consume(ctx, stdout, command, request.UpstreamModel, runDir, request.RunID, events)
 	}()
 	return events, nil
 }
 
-func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, requestedModel string, events chan<- provider.Event) {
+func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, requestedModel, runDir, runID string, events chan<- provider.Event) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
 	var streamed strings.Builder
@@ -178,7 +180,9 @@ func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, requested
 				OutputTokens: pricing.OptionalCount{Value: event.Usage.OutputTokens, Present: true},
 			}
 			var costs []provider.CostObservation
-			if cost, err := pricing.ParseDecimal(event.TotalCostUSD.String()); err == nil && cost.Nanos() >= 0 {
+			if credit, found := readSessionCredit(ctx, runDir, runID); found {
+				costs = []provider.CostObservation{{Unit: "POINTS", Total: credit}}
+			} else if cost, err := pricing.ParseDecimal(event.TotalCostUSD.String()); err == nil && cost.Nanos() >= 0 {
 				costs = []provider.CostObservation{{Unit: "USD", Total: cost.String()}}
 			}
 			final := &provider.Final{OutputText: finalText, EffectiveModel: effectiveModel, Usage: usage, Costs: costs}
@@ -206,6 +210,63 @@ func consume(ctx context.Context, stdout io.Reader, command *exec.Cmd, requested
 		return
 	}
 	send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("WorkBuddy ended without result")})
+}
+
+func readSessionCredit(ctx context.Context, runDir, runID string) (string, bool) {
+	if runDir == "" || runID == "" || filepath.Base(runID) != runID {
+		return "", false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", false
+	}
+	resolvedDir, err := filepath.EvalSymlinks(runDir)
+	if err != nil {
+		resolvedDir = filepath.Clean(runDir)
+	}
+	projectKey := strings.Trim(strings.ReplaceAll(resolvedDir, string(filepath.Separator), "-"), "-")
+	sessionPath := filepath.Join(home, ".codebuddy", "projects", projectKey, runID+".jsonl")
+	for attempt := 0; attempt < 8; attempt++ {
+		if credit, found := readSessionCreditFile(sessionPath); found {
+			return credit, true
+		}
+		timer := time.NewTimer(40 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", false
+		case <-timer.C:
+		}
+	}
+	return "", false
+}
+
+func readSessionCreditFile(path string) (string, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(io.LimitReader(file, 32<<20))
+	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	var latest string
+	for scanner.Scan() {
+		var record struct {
+			ProviderData struct {
+				RawUsage struct {
+					Credit json.Number `json:"credit"`
+				} `json:"rawUsage"`
+			} `json:"providerData"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &record) != nil || record.ProviderData.RawUsage.Credit == "" {
+			continue
+		}
+		credit, parseErr := pricing.ParseDecimal(record.ProviderData.RawUsage.Credit.String())
+		if parseErr == nil && credit.Nanos() >= 0 {
+			latest = credit.String()
+		}
+	}
+	return latest, latest != ""
 }
 
 func safeContentType(contentType string) bool {

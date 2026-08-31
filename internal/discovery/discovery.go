@@ -22,6 +22,7 @@ type Model struct {
 	DisplayName               string   `json:"display_name"`
 	Description               string   `json:"description,omitempty"`
 	SupportedReasoningEfforts []string `json:"supported_reasoning_efforts,omitempty"`
+	CreditMultiplier          string   `json:"credit_multiplier,omitempty"`
 }
 
 func Models(ctx context.Context, provider config.ProviderConfig) ([]Model, error) {
@@ -46,7 +47,7 @@ func Models(ctx context.Context, provider config.ProviderConfig) ([]Model, error
 			ExpectedVersion: provider.ExpectedVersion, ExtraArgs: provider.ExtraArgs,
 		})
 		for _, item := range discovered {
-			models = append(models, Model{ID: item.ID, DisplayName: item.DisplayName})
+			models = append(models, Model{ID: item.ID, DisplayName: item.DisplayName, CreditMultiplier: item.CreditMultiplier})
 		}
 	default:
 		err = fmt.Errorf("provider type %q does not support discovery", provider.Type)

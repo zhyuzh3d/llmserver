@@ -81,7 +81,7 @@ func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
 	if err := repository.MarkRunning(context.Background(), reservation.RunID); err != nil {
 		t.Fatal(err)
 	}
-	quota := json.RawMessage(`[{"limit_id":"codex:primary","unit":"percent_used","before":7,"after":8,"delta":1,"status":"observed","attribution":"shared_account_window"}]`)
+	quota := json.RawMessage(`[{"limit_id":"codex:primary","unit":"percent_used","before":7,"after":8,"delta":1,"window_duration_minutes":10080,"resets_at":1788749661,"status":"observed","attribution":"shared_account_window"}]`)
 	completion := gateway.RunCompletion{
 		RunID: reservation.RunID, ResponseJSON: []byte(`{"id":"resp_quota"}`), BillingJSON: []byte(`{"request_id":"req_quota"}`),
 		InputTokens: 1, OutputTokens: 1, InputSource: "provider_reported", OutputSource: "provider_reported",
@@ -105,7 +105,7 @@ func TestCompletePersistsQuotaObservationSeparately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Groups) != 1 || len(report.Groups[0].QuotaTotals) != 1 || report.Groups[0].QuotaTotals[0].Delta != 1 {
+	if len(report.Groups) != 1 || len(report.Groups[0].QuotaTotals) != 1 || report.Groups[0].QuotaTotals[0].Delta != 1 || report.Groups[0].QuotaTotals[0].WindowDurationMinutes == nil || *report.Groups[0].QuotaTotals[0].WindowDurationMinutes != 10080 {
 		t.Fatalf("quota report = %#v", report.Groups)
 	}
 }
