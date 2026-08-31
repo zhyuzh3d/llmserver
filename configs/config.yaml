@@ -30,26 +30,26 @@ providers:
         source: configured
     - id: codex-local
       type: codex_exec
-      display_name: Local Codex subscription
+      display_name: Codex
       executable: /Applications/ChatGPT.app/Contents/Resources/codex
       expected_version: codex-cli 0.151.
       observe_quota: true
       default_public_price:
-        revision: codex-default-public-v1
+        revision: codex-local-default-1788155856746
         currency: USD
-        input_per_million: "2.000000"
-        output_per_million: "12.000000"
+        input_per_million: "2.00"
+        output_per_million: "12.00"
         source: configured
     - id: workbuddy-local
       type: workbuddy_exec
-      display_name: Local WorkBuddy subscription
+      display_name: WorkBuddy
       executable: /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy
       expected_version: 2.115.
       default_public_price:
-        revision: workbuddy-default-public-v1
+        revision: workbuddy-local-default-1788155868655
         currency: USD
-        input_per_million: "2.000000"
-        output_per_million: "12.000000"
+        input_per_million: "2.00"
+        output_per_million: "12.00"
         source: configured
 deployments:
     - id: luna

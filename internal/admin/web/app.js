@@ -32,11 +32,18 @@ const byID = (items, id) => items.find(item => item.id === id);
 const clone = value => JSON.parse(JSON.stringify(value));
 const providerType = type => type === "openai_responses" ? "API 供应商" : "系统供应商";
 const providerName = id => byID(state.config.providers, id)?.display_name || id;
+const usageProviderName = id => {
+  const provider = byID(state.config.providers, id);
+  if (provider?.type === "codex_exec") return "Codex";
+  if (provider?.type === "workbuddy_exec") return "WorkBuddy";
+  return provider?.display_name || id;
+};
 const secretHint = (kind, id) => kind === "provider" ? state.secretStatus.provider_api_key_hints?.[id] : state.secretStatus.client_token_hints?.[id];
 const fixedDecimal = (value, digits) => {
   const number = Number(value ?? 0);
   return Number.isFinite(number) ? number.toFixed(digits) : Number(0).toFixed(digits);
 };
+const compactDecimal = (value, digits) => fixedDecimal(value, digits).replace(/\.?0+$/, "");
 
 function normalizedPrice(value, label) {
   const number = Number(value);
@@ -144,7 +151,7 @@ function providerCards(providers, editable) {
     const isAPI = provider.type === "openai_responses";
     const key = isAPI ? (secretHint("provider", provider.id) || "未配置 API Key") : "使用当前系统登录态";
     return `<article class="provider-card">
-      <header><div><span class="category">${providerType(provider.type)}</span><h3>${escapeHTML(provider.display_name || provider.id)}</h3></div><i class="state-dot ${isAPI && !state.secretStatus.provider_api_keys[provider.id] ? "warning" : ""}"></i></header>
+      <header><div><span class="category">${providerType(provider.type)}</span><h3 title="${escapeHTML(provider.display_name || provider.id)}">${escapeHTML(provider.display_name || provider.id)}</h3></div><i class="state-dot ${isAPI && !state.secretStatus.provider_api_keys[provider.id] ? "warning" : ""}"></i></header>
       <p class="provider-id">${escapeHTML(provider.id)}</p>
       <dl><div><dt>连接</dt><dd>${escapeHTML(provider.base_url || provider.executable)}</dd></div><div><dt>${isAPI ? "API Key" : "凭据"}</dt><dd class="mono">${escapeHTML(key)}</dd></div><div><dt>模型</dt><dd>${enabled} 已启用 / ${models.length} 已配置</dd></div></dl>
       <footer><button class="button primary provider-models" data-provider="${escapeHTML(provider.id)}">刷新 / 设置模型</button>${editable ? `<button class="button edit-provider" data-provider="${escapeHTML(provider.id)}">编辑</button>` : ""}${isAPI ? `<button class="icon-copy copy-secret" data-kind="provider" data-id="${escapeHTML(provider.id)}" title="复制 API Key">复制 Key</button>` : ""}</footer>
@@ -410,7 +417,7 @@ function renderAccess() {
 
 function accessKeyCard(client, index) {
   return `<article class="key-card" data-client-index="${index}">
-    <div class="key-summary"><div><span class="category">ACCESS KEY</span><h3>${escapeHTML(client.id)}</h3><code>${escapeHTML(secretHint("client", client.id) || "未配置")}</code></div><div class="key-actions"><button class="button copy-client">复制</button><button class="button regenerate-client">重新生成</button><button class="button danger remove-client">删除</button></div></div>
+    <div class="key-summary"><div><span class="category">ACCESS KEY</span><h3 title="${escapeHTML(client.id)}">${escapeHTML(client.id)}</h3><code title="${escapeHTML(secretHint("client", client.id) || "未配置")}">${escapeHTML(secretHint("client", client.id) || "未配置")}</code></div><div class="key-actions"><button class="button copy-client">复制</button><button class="button regenerate-client">重新生成</button><button class="button danger remove-client">删除</button></div></div>
     <details><summary>权限设置 <span>${client.allowed_deployments.length} 个模型</span></summary><div class="key-settings">
       <label class="field"><span>密钥名称</span><input class="client-name" value="${escapeHTML(client.id)}"></label>
       <label class="check-field"><input type="checkbox" class="quota-toggle" ${client.include_quota_observations ? "checked" : ""}><span>允许响应返回订阅额度观测</span></label>
@@ -558,7 +565,7 @@ function usageReport(groupBy, report, selected) {
 
 function usageSummaryCard(groupBy, group) {
   const title = groupBy === "provider" ? providerName(group.id) : group.id;
-  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3>${escapeHTML(title)}</h3></div><strong>${group.runs}</strong></header><div class="usage-kpis"><div><span>平台价消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际供应商消耗</span><b>${formatActual(group.actual_totals, group.quota_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 输入 · ${Number(group.output_tokens).toLocaleString()} 输出</footer></article>`;
+  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3 title="${escapeHTML(title)}">${escapeHTML(title)}</h3></div><strong title="${group.runs} 次请求">${group.runs}</strong></header><div class="usage-kpis"><div><span>平台消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际消耗</span><b>${formatActual(group.actual_totals, group.quota_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 入 · ${Number(group.output_tokens).toLocaleString()} 出</footer></article>`;
 }
 
 function usageModelsTable(groupBy, rows) {
@@ -568,7 +575,11 @@ function usageModelsTable(groupBy, rows) {
 
 function formatUnitTotals(items = []) {
   if (!items.length) return `<span class="muted">—</span>`;
-  return items.map(item => `<span class="amount">${escapeHTML(item.unit)} ${fixedDecimal(item.total, 4)}</span>`).join(" ");
+  return items.map(item => amountChip(`${item.unit} ${compactDecimal(item.total, String(item.unit).toUpperCase() === "POINTS" ? 2 : 4)}`, "", "", `${item.unit} ${item.total}`)).join("");
+}
+
+function amountChip(text, className = "", badge = "", title = text) {
+  return `<span class="amount ${className}" title="${escapeHTML(title)}"><span class="amount-main">${escapeHTML(text)}</span>${badge ? `<small>${escapeHTML(badge)}</small>` : ""}</span>`;
 }
 
 function formatActual(actual = [], quota = [], showProvider = false, fixedProviderID = "") {
@@ -576,31 +587,35 @@ function formatActual(actual = [], quota = [], showProvider = false, fixedProvid
   const values = [];
   for (const providerID of providerIDs) {
     const provider = byID(state.config.providers, providerID);
-    const prefix = showProvider ? `${escapeHTML(providerName(providerID))} · ` : "";
+    const shortProvider = usageProviderName(providerID);
+    const prefix = showProvider ? `${shortProvider} · ` : "";
     const providerActual = actual.filter(item => item.provider_id === providerID);
     const providerQuota = quota.filter(item => item.provider_id === providerID);
     if (provider?.type === "codex_exec") {
       const weekly = providerQuota.filter(item => item.status === "observed" && Number(item.window_duration_minutes) >= 6 * 24 * 60 && Number(item.window_duration_minutes) <= 8 * 24 * 60);
       const selected = weekly.find(item => item.limit_id === "codex:primary") || weekly.sort((a, b) => Number(b.latest_after || 0) - Number(a.latest_after || 0))[0];
       if (selected) {
-        values.push(`<span class="amount quota">${prefix}周额度已用 ${Number(selected.latest_after || 0).toFixed(2)}%<small>时段变化 ${Number(selected.delta || 0).toFixed(4)}%</small></span>`);
+        const delta = Number(selected.delta || 0);
+        const deltaText = `${delta > 0 ? "+" : ""}${compactDecimal(delta, 2)}%`;
+        values.push(amountChip(`${prefix}周 ${compactDecimal(selected.latest_after || 0, 2)}%`, "quota", deltaText, `${providerName(providerID)}：周额度已用 ${fixedDecimal(selected.latest_after || 0, 2)}%，所选时段变化 ${deltaText}`));
       } else if (providerQuota.length) {
-        values.push(`<span class="amount quota unavailable">${prefix}周额度暂不可比较</span>`);
+        values.push(amountChip(`${prefix}周额度不可比`, "quota unavailable", "", `${providerName(providerID)}：周额度窗口暂不可比较`));
       }
       continue;
     }
     if (provider?.type === "workbuddy_exec") {
       const points = providerActual.filter(item => String(item.unit).toUpperCase() === "POINTS");
       for (const item of points) {
-        values.push(`<span class="amount ${item.source === "provider_reported" ? "reported" : "estimated"}">${prefix}积分 ${fixedDecimal(item.total, 4)}<small>${item.source === "provider_reported" ? "实报" : "估算"}</small></span>`);
+        values.push(amountChip(`${prefix}积分 ${compactDecimal(item.total, 2)}`, item.source === "provider_reported" ? "reported" : "estimated", item.source === "provider_reported" ? "实报" : "估算", `${providerName(providerID)}：积分 ${item.total}（${item.source === "provider_reported" ? "供应商实报" : "配置估算"}）`));
       }
       if (!points.length && providerActual.length) {
-        values.push(`<span class="amount unavailable">${prefix}历史记录无积分</span>`);
+        values.push(amountChip(`${prefix}无积分记录`, "unavailable", "", `${providerName(providerID)}：历史记录没有积分字段`));
       }
       continue;
     }
     for (const item of providerActual) {
-      values.push(`<span class="amount ${item.source === "provider_reported" ? "reported" : "estimated"}">${prefix}${escapeHTML(item.unit)} ${fixedDecimal(item.total, 4)}<small>${item.source === "provider_reported" ? "实报" : "估算"}</small></span>`);
+      const digits = String(item.unit).toUpperCase() === "POINTS" ? 2 : 4;
+      values.push(amountChip(`${prefix}${item.unit} ${compactDecimal(item.total, digits)}`, item.source === "provider_reported" ? "reported" : "estimated", item.source === "provider_reported" ? "实报" : "估算", `${providerName(providerID)}：${item.unit} ${item.total}（${item.source === "provider_reported" ? "供应商实报" : "配置估算"}）`));
     }
   }
   return values.length ? values.join(" ") : `<span class="muted">未提供</span>`;
