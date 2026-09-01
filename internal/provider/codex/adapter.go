@@ -195,10 +195,7 @@ func (a *Adapter) startDirect(ctx context.Context, request provider.Request) (*h
 		a.directBlockedUntil.Store(time.Now().Add(time.Minute).UnixNano())
 		return nil, true, err
 	}
-	effort := request.ReasoningEffort
-	if effort == "" {
-		effort = a.config.DefaultReasoning
-	}
+	effort := effectiveReasoningEffort(request.ReasoningEffort, a.config.DefaultReasoning)
 	body := map[string]any{
 		"model":               request.UpstreamModel,
 		"instructions":        modelOnlyInstructions,
@@ -610,10 +607,7 @@ func (w *appServerWorker) run(ctx context.Context, config Config, request provid
 		"threadId": threadResult.Thread.ID,
 		"input":    []map[string]string{{"type": "text", "text": request.CanonicalInput}},
 	}
-	effort := request.ReasoningEffort
-	if effort == "" {
-		effort = config.DefaultReasoning
-	}
+	effort := effectiveReasoningEffort(request.ReasoningEffort, config.DefaultReasoning)
 	if effort != "" {
 		turnParams["effort"] = effort
 	}
@@ -705,6 +699,13 @@ func (w *appServerWorker) run(ctx context.Context, config Config, request provid
 			// part of the public response and require no extra request.
 		}
 	}
+}
+
+func effectiveReasoningEffort(requested, fallback string) string {
+	if requested != "" {
+		return requested
+	}
+	return fallback
 }
 
 func (w *appServerWorker) rpcID() int64 {

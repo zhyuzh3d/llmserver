@@ -36,6 +36,10 @@ exit 8
 		if !ok || len(tools) != 0 || body["model"] != "gpt-test" {
 			t.Errorf("unexpected direct request: %#v", body)
 		}
+		reasoning, ok := body["reasoning"].(map[string]any)
+		if !ok || reasoning["effort"] != "none" {
+			t.Errorf("explicit none reasoning was not forwarded: %#v", body["reasoning"])
+		}
 		response.Header().Set("Content-Type", "text/event-stream")
 		_, _ = response.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"DIRECT_OK\"}\n\n"))
 		_, _ = response.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n"))
@@ -49,7 +53,7 @@ exit 8
 		t.Fatal(err)
 	}
 	t.Cleanup(adapter.Retire)
-	events, err := adapter.Start(context.Background(), provider.Request{UpstreamModel: "gpt-test", CanonicalInput: "hello"})
+	events, err := adapter.Start(context.Background(), provider.Request{UpstreamModel: "gpt-test", CanonicalInput: "hello", ReasoningEffort: "none"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +72,36 @@ exit 8
 	}
 	if text != "DIRECT_OK" || final == nil || final.Usage.InputTokens.Value != 12 || final.Usage.OutputTokens.Value != 3 {
 		t.Fatalf("text=%q final=%#v", text, final)
+	}
+}
+
+func TestCompleteReasoningEffortsAddsNoneOnlyToVerifiedModels(t *testing.T) {
+	tests := []struct {
+		model    string
+		reported []string
+		want     string
+	}{
+		{model: "gpt-5.6-luna", reported: []string{"low", "medium"}, want: "none,low,medium"},
+		{model: "gpt-5.6-terra", reported: []string{"low", "none", "high"}, want: "none,low,high"},
+		{model: "gpt-5.6-sol", reported: []string{"low", "xhigh", "ultra"}, want: "none,low,xhigh,ultra"},
+		{model: "gpt-future", reported: []string{"low", "high"}, want: "low,high"},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			got := strings.Join(completeReasoningEfforts(test.model, test.reported), ",")
+			if got != test.want {
+				t.Fatalf("efforts=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveReasoningEffortPreservesExplicitNone(t *testing.T) {
+	if got := effectiveReasoningEffort("none", "low"); got != "none" {
+		t.Fatalf("explicit effort=%q", got)
+	}
+	if got := effectiveReasoningEffort("", "low"); got != "low" {
+		t.Fatalf("default effort=%q", got)
 	}
 }
 

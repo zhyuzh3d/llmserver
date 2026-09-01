@@ -1,16 +1,19 @@
 const state = {
   config: null,
   secretStatus: null,
+  dailyQuotas: [],
   secrets: null,
   secretUpdates: { clients: {}, providers: {}, clientRenames: {} },
   activeView: "overview",
   dirty: false,
+  dirtyClient: null,
   providerDraft: null,
   modelRows: [],
   modelProviderID: "",
   usageRange: { value: 1, unit: "days" },
   platformProvider: "",
   usageClient: "",
+  accessDetails: {},
 };
 
 const content = document.querySelector("#content");
@@ -39,12 +42,81 @@ const usageProviderName = id => {
   if (provider?.type === "workbuddy_exec") return "WorkBuddy";
   return provider?.display_name || id;
 };
-const secretHint = (kind, id) => kind === "provider" ? state.secretStatus.provider_api_key_hints?.[id] : state.secretStatus.client_token_hints?.[id];
+const secretHint = (kind, id) => {
+  if (kind === "provider") return state.secretStatus.provider_api_key_hints?.[id];
+  const savedID = state.secretUpdates.clientRenames[id] || id;
+  return state.secretStatus.client_token_hints?.[id] || state.secretStatus.client_token_hints?.[savedID];
+};
 const fixedDecimal = (value, digits) => {
   const number = Number(value ?? 0);
   return Number.isFinite(number) ? number.toFixed(digits) : Number(0).toFixed(digits);
 };
 const compactDecimal = (value, digits) => fixedDecimal(value, digits).replace(/\.?0+$/, "");
+const uiStateStorageKey = "llmserver.admin.ui-state.v1";
+const legacyAccessDetailsStorageKey = "llmserver.admin.access-details.v1";
+const validViews = new Set(["overview", "providers", "platform_usage", "access", "user_usage"]);
+
+function restoreUIState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(uiStateStorageKey) || "{}");
+    if (validViews.has(saved.activeView)) state.activeView = saved.activeView;
+    if (saved.usageRange && ["hours", "days"].includes(saved.usageRange.unit)) {
+      const max = saved.usageRange.unit === "hours" ? 8760 : 365;
+      const value = Number(saved.usageRange.value);
+      if (Number.isInteger(value) && value >= 1 && value <= max) state.usageRange = { value, unit: saved.usageRange.unit };
+    }
+    if (typeof saved.platformProvider === "string") state.platformProvider = saved.platformProvider;
+    if (typeof saved.usageClient === "string") state.usageClient = saved.usageClient;
+    if (saved.accessDetails && typeof saved.accessDetails === "object" && !Array.isArray(saved.accessDetails)) {
+      state.accessDetails = Object.fromEntries(Object.entries(saved.accessDetails).filter(([, open]) => typeof open === "boolean"));
+    } else {
+      const legacy = JSON.parse(localStorage.getItem(legacyAccessDetailsStorageKey) || "{}");
+      if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+        state.accessDetails = Object.fromEntries(Object.entries(legacy).filter(([, open]) => typeof open === "boolean"));
+      }
+    }
+  } catch (_) {
+    // Invalid or unavailable browser storage falls back to stable defaults.
+  }
+}
+
+function persistUIState() {
+  try {
+    localStorage.setItem(uiStateStorageKey, JSON.stringify({
+      activeView: state.activeView,
+      usageRange: state.usageRange,
+      platformProvider: state.platformProvider,
+      usageClient: state.usageClient,
+      accessDetails: state.accessDetails,
+    }));
+    localStorage.removeItem(legacyAccessDetailsStorageKey);
+  } catch (_) {
+    // The console remains usable when browser storage is unavailable.
+  }
+}
+
+function accessDetailsOpen(clientID) {
+  return state.accessDetails[clientID] === true;
+}
+
+function rememberAccessDetails(clientID, open) {
+  state.accessDetails[clientID] = open;
+  persistUIState();
+}
+
+function renameAccessDetails(oldID, newID) {
+  if (!oldID || oldID === newID) return;
+  if (Object.prototype.hasOwnProperty.call(state.accessDetails, oldID)) {
+    state.accessDetails[newID] = state.accessDetails[oldID];
+    delete state.accessDetails[oldID];
+    persistUIState();
+  }
+}
+
+function forgetAccessDetails(clientID) {
+  delete state.accessDetails[clientID];
+  persistUIState();
+}
 
 function normalizedPrice(value, label) {
   const number = Number(value);
@@ -80,25 +152,39 @@ function showToast(message, error = false) {
 
 function markDirty() {
   state.dirty = true;
-  document.querySelector("#save-all").textContent = "保存并生效 ·";
+}
+
+function claimClientDraft(client) {
+  if (state.dirtyClient && state.dirtyClient !== client) {
+    showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
+    return false;
+  }
+  state.dirtyClient = client;
+  markDirty();
+  return true;
 }
 
 async function loadState() {
   const payload = await api("/admin/api/state");
   state.config = payload.config;
   state.secretStatus = payload.secret_status;
+  state.dailyQuotas = payload.daily_quotas || [];
   state.secrets = null;
   state.secretUpdates = { clients: {}, providers: {}, clientRenames: {} };
   state.dirty = false;
-  document.querySelector("#save-all").textContent = "保存并生效";
+  state.dirtyClient = null;
+  if (state.platformProvider && !byID(state.config.providers, state.platformProvider)) state.platformProvider = "";
+  if (state.usageClient && !byID(state.config.clients, state.usageClient)) state.usageClient = "";
+  const clientIDs = new Set(state.config.clients.map(client => client.id));
+  state.accessDetails = Object.fromEntries(Object.entries(state.accessDetails).filter(([id]) => clientIDs.has(id)));
+  persistUIState();
   document.querySelector("#admin-address").textContent = state.config.server.admin_listen;
   render();
 }
 
-async function saveAll() {
-  const button = document.querySelector("#save-all");
-  button.disabled = true;
-  button.textContent = "正在验证…";
+async function saveAll(button = null) {
+  const oldText = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = "正在验证…"; }
   try {
     await api("/admin/api/config", {
       method: "PUT",
@@ -116,8 +202,7 @@ async function saveAll() {
     showToast(error.message, true);
     return false;
   } finally {
-    button.disabled = false;
-    if (state.dirty) button.textContent = "保存并生效 ·";
+    if (button?.isConnected) { button.disabled = false; button.textContent = oldText; }
   }
 }
 
@@ -438,10 +523,19 @@ function renderAccess() {
 }
 
 function accessKeyCard(client, index) {
+  const quotaID = state.secretUpdates.clientRenames[client.id] || client.id;
+  const quota = state.dailyQuotas.find(item => item.client_id === quotaID) || { used_usd: "0" };
+  const limit = client.daily_limit_usd || "";
+  const quotaText = limit ? `USD ${fixedDecimal(quota.used_usd, 4)} / ${fixedDecimal(limit, 2)}` : `USD ${fixedDecimal(quota.used_usd, 4)} · 不限`;
   return `<article class="key-card" data-client-index="${index}">
-    <div class="key-summary"><div><span class="category">ACCESS KEY</span><h3 title="${escapeHTML(client.id)}">${escapeHTML(client.id)}</h3><code title="${escapeHTML(secretHint("client", client.id) || "未配置")}">${escapeHTML(secretHint("client", client.id) || "未配置")}</code></div><div class="key-actions"><button class="button copy-client">复制</button><button class="button regenerate-client">重新生成</button><button class="button danger remove-client">删除</button></div></div>
-    <details><summary>权限设置 <span>${client.allowed_deployments.length} 个模型</span></summary><div class="key-settings">
-      <label class="field"><span>密钥名称</span><input class="client-name" value="${escapeHTML(client.id)}"></label>
+    <div class="key-summary"><div><span class="category">ACCESS KEY</span><h3 title="${escapeHTML(client.id)}">${escapeHTML(client.id)}</h3><code title="${escapeHTML(secretHint("client", client.id) || "未配置")}">${escapeHTML(secretHint("client", client.id) || "未配置")}</code></div><div class="key-actions"><button class="button primary save-client" ${state.dirtyClient === client ? "" : "disabled"}>保存并生效</button><button class="button copy-client">复制</button><button class="button regenerate-client">重新生成</button><button class="button danger remove-client">删除</button></div></div>
+    <details ${accessDetailsOpen(client.id) ? "open" : ""}><summary>权限设置 <span>${client.allowed_deployments.length} 个模型</span></summary><div class="key-settings">
+      <div class="key-quota-row">
+        <label class="field key-name-field"><span>密钥名称</span><input class="client-name" value="${escapeHTML(client.id)}"></label>
+        <label class="field daily-limit-field"><span>每日额度 · USD</span><input class="client-daily-limit" type="number" min="0.01" step="0.01" placeholder="不限" value="${escapeHTML(limit)}"></label>
+        <div class="daily-usage"><span>今日已用 · 模拟价</span><strong title="${escapeHTML(quotaText)}">${escapeHTML(quotaText)}</strong><small>每日 00:00 自动重置</small></div>
+        <button class="button reset-daily-quota" type="button">立即重置</button>
+      </div>
       <div class="permission-grid">${state.config.deployments.map(model => `<label><input type="checkbox" value="${escapeHTML(model.id)}" ${client.allowed_deployments.includes(model.id) ? "checked" : ""}>${escapeHTML(model.id)}</label>`).join("")}</div>
     </div></details>
   </article>`;
@@ -451,36 +545,75 @@ function bindAccessEditors() {
   document.querySelectorAll("[data-client-index]").forEach(card => {
     const index = Number(card.dataset.clientIndex);
     const client = state.config.clients[index];
+    card.querySelector("details").addEventListener("toggle", event => rememberAccessDetails(client.id, event.currentTarget.open));
+    card.querySelector(".save-client").addEventListener("click", event => saveClient(client, event.currentTarget));
     card.querySelector(".copy-client").addEventListener("click", () => copySecret("client", client.id));
     card.querySelector(".regenerate-client").addEventListener("click", () => regenerateClient(client));
-    card.querySelector(".remove-client").addEventListener("click", () => {
+    card.querySelector(".remove-client").addEventListener("click", async () => {
+      if (state.dirtyClient) return showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
       if (!confirm(`删除访问密钥 ${client.id}？`)) return;
-      state.config.clients.splice(index, 1); markDirty(); renderAccess();
+      const removed = state.config.clients.splice(index, 1)[0];
+      markDirty();
+      if (await saveAll()) {
+        forgetAccessDetails(client.id);
+      } else {
+        state.config.clients.splice(index, 0, removed);
+        state.dirty = false;
+        renderAccess();
+      }
     });
     card.querySelector(".client-name").addEventListener("change", event => {
+      if (!claimClientDraft(client)) return renderAccess();
       const oldID = client.id;
       client.id = event.target.value.trim();
       if (oldID !== client.id) {
         const originalID = state.secretUpdates.clientRenames[oldID] || oldID;
         delete state.secretUpdates.clientRenames[oldID];
         state.secretUpdates.clientRenames[client.id] = originalID;
+        renameAccessDetails(oldID, client.id);
       }
-      markDirty(); renderAccess();
+      renderAccess();
     });
+    card.querySelector(".client-daily-limit").addEventListener("change", event => {
+      const raw = event.target.value.trim();
+      if (raw === "") {
+        if (!claimClientDraft(client)) return renderAccess();
+        client.daily_limit_usd = "";
+      } else {
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) {
+          event.target.value = client.daily_limit_usd || "";
+          showToast("每日额度必须是大于 0 的美元金额，留空表示不限。", true);
+          return;
+        }
+        if (!claimClientDraft(client)) return renderAccess();
+        client.daily_limit_usd = value.toFixed(2);
+        event.target.value = client.daily_limit_usd;
+      }
+      card.querySelector(".save-client").disabled = false;
+    });
+    card.querySelector(".reset-daily-quota").addEventListener("click", () => resetDailyQuota(client));
     card.querySelectorAll(".permission-grid input").forEach(input => input.addEventListener("change", () => {
+      if (!claimClientDraft(client)) return renderAccess();
       client.allowed_deployments = [...card.querySelectorAll(".permission-grid input:checked")].map(item => item.value);
-      markDirty();
+      card.querySelector(".save-client").disabled = false;
     }));
   });
 }
 
+async function saveClient(client, button) {
+  if (state.dirtyClient !== client) return;
+  await saveAll(button);
+}
+
 async function addClient() {
+  if (state.dirtyClient) return showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
   let suffix = 1;
   while (byID(state.config.clients, `access-${suffix}`)) suffix++;
   const id = `access-${suffix}`;
   try {
     const result = await api("/admin/api/tokens/generate", { method: "POST", body: "{}" });
-    state.config.clients.push({ id, allowed_deployments: [] });
+    state.config.clients.push({ id, allowed_deployments: [], daily_limit_usd: "" });
     state.secretUpdates.clients[id] = result.token;
     markDirty();
     if (await saveAll()) {
@@ -490,7 +623,25 @@ async function addClient() {
   } catch (error) { showToast(error.message, true); }
 }
 
+async function resetDailyQuota(client) {
+  const button = document.querySelector(`[data-client-index="${state.config.clients.indexOf(client)}"] .reset-daily-quota`);
+  if (button) button.disabled = true;
+  try {
+    if (state.dirtyClient) return showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
+    const result = await api(`/admin/api/clients/${encodeURIComponent(client.id)}/daily-quota/reset`, { method: "POST", body: "{}" });
+    state.dailyQuotas = state.dailyQuotas.filter(item => item.client_id !== client.id);
+    state.dailyQuotas.push(result);
+    renderAccess();
+    showToast(`${client.id} 今日额度已立即重置。`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
 async function regenerateClient(client) {
+  if (state.dirtyClient) return showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
   if (!confirm(`重新生成 ${client.id}？旧密钥保存后立即失效。`)) return;
   try {
     const result = await api("/admin/api/tokens/generate", { method: "POST", body: "{}" });
@@ -506,7 +657,8 @@ async function regenerateClient(client) {
 async function copySecret(kind, id) {
   try {
     if (!state.secrets) state.secrets = await api("/admin/api/secrets");
-    const value = kind === "provider" ? state.secrets.provider_api_keys?.[id] : state.secrets.client_tokens?.[id];
+    const savedID = kind === "client" ? state.secretUpdates.clientRenames[id] || id : id;
+    const value = kind === "provider" ? state.secrets.provider_api_keys?.[id] : state.secrets.client_tokens?.[savedID];
     if (!value) return showToast("当前没有已保存的密钥。", true);
     await copyText(value);
     showToast(kind === "provider" ? "API Key 已复制。" : "访问密钥已复制。")
@@ -557,18 +709,27 @@ function usageToolbar(groupBy, selected) {
 function bindUsageControls(groupBy) {
   document.querySelector("#usage-entity")?.addEventListener("change", event => {
     if (groupBy === "provider") state.platformProvider = event.target.value; else state.usageClient = event.target.value;
+    persistUIState();
     renderUsage(groupBy);
   });
   document.querySelectorAll("[data-range]").forEach(button => button.addEventListener("click", () => {
     const [value, unit] = button.dataset.range.split("-");
     state.usageRange = { value: Number(value), unit };
+    persistUIState();
     renderUsage(groupBy);
   }));
   document.querySelector("#usage-window-value")?.addEventListener("change", event => {
-    state.usageRange.value = Math.max(1, Number(event.target.value) || 1); renderUsage(groupBy);
+    const max = state.usageRange.unit === "hours" ? 8760 : 365;
+    state.usageRange.value = Math.min(max, Math.max(1, Math.floor(Number(event.target.value) || 1)));
+    persistUIState();
+    renderUsage(groupBy);
   });
   document.querySelector("#usage-window-unit")?.addEventListener("change", event => {
-    state.usageRange.unit = event.target.value; renderUsage(groupBy);
+    state.usageRange.unit = event.target.value;
+    const max = state.usageRange.unit === "hours" ? 8760 : 365;
+    state.usageRange.value = Math.min(max, state.usageRange.value);
+    persistUIState();
+    renderUsage(groupBy);
   });
 }
 
@@ -637,10 +798,14 @@ function formatRange(since, until) {
   return `${new Date(since).toLocaleString()} — ${new Date(until).toLocaleString()}`;
 }
 
-function switchView(view) { state.activeView = view; render(); }
+function switchView(view) {
+  if (state.dirtyClient && view !== "access") return showToast(`请先保存 ${state.dirtyClient.id} 的修改。`, true);
+  state.activeView = view;
+  persistUIState();
+  render();
+}
 
 document.querySelectorAll(".nav-item").forEach(item => item.addEventListener("click", () => switchView(item.dataset.view)));
-document.querySelector("#save-all").addEventListener("click", saveAll);
 document.querySelector("#apply-models").addEventListener("click", applyModels);
 document.querySelector("#apply-provider").addEventListener("click", applyProvider);
 document.querySelector("#delete-provider").addEventListener("click", deleteProvider);
@@ -650,4 +815,5 @@ providerDialog.addEventListener("click", event => {
 });
 window.addEventListener("beforeunload", event => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
 document.querySelector("#toast-close").addEventListener("click", hideToast);
+restoreUIState();
 loadState().catch(error => { content.replaceChildren(); showToast(error.message, true); });

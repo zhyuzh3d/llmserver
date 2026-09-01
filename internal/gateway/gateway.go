@@ -274,14 +274,21 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 	}
 
 	if s.repository != nil {
+		now := time.Now()
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 		record, created, reserveErr := s.repository.Reserve(ctx, RunReservation{
 			RunID:          runID,
 			ClientID:       client.ID,
 			DeploymentID:   deployment.ID,
 			IdempotencyKey: request.IdempotencyKey,
 			Fingerprint:    fingerprint,
+			DailyLimitUSD:  client.DailyLimitUSD,
+			DayStart:       dayStart,
 		})
 		if reserveErr != nil {
+			if errors.Is(reserveErr, ErrDailyQuotaExceeded) {
+				return nil, "", &Error{Status: http.StatusPaymentRequired, Code: "daily_quota_exceeded", Message: "access key daily quota has been used up"}
+			}
 			return nil, "", &Error{Status: http.StatusInternalServerError, Code: "persistence_failed", Message: "request could not be persisted"}
 		}
 		if !created {

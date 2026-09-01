@@ -38,6 +38,7 @@ type ServerConfig struct {
 type ClientConfig struct {
 	ID                 string   `yaml:"id" json:"id"`
 	AllowedDeployments []string `yaml:"allowed_deployments" json:"allowed_deployments"`
+	DailyLimitUSD      string   `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 	Token              Secret   `yaml:"-" json:"-"`
 }
 
@@ -325,6 +326,7 @@ func (c *Config) Validate() error {
 	}
 
 	deploymentIDs := make(map[string]struct{}, len(c.Deployments))
+	deploymentCurrencies := make(map[string]string, len(c.Deployments))
 	for _, deployment := range c.Deployments {
 		if deployment.ID == "" || deployment.UpstreamModel == "" {
 			return errors.New("deployment id and upstream model are required")
@@ -333,6 +335,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate deployment id %q", deployment.ID)
 		}
 		deploymentIDs[deployment.ID] = struct{}{}
+		deploymentCurrencies[deployment.ID] = strings.ToUpper(strings.TrimSpace(deployment.Price.Currency))
 		if _, exists := providerIDs[deployment.ProviderID]; !exists {
 			return fmt.Errorf("deployment %q references unknown provider %q", deployment.ID, deployment.ProviderID)
 		}
@@ -367,9 +370,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate client id %q", client.ID)
 		}
 		clientIDs[client.ID] = struct{}{}
+		if client.DailyLimitUSD != "" {
+			limit, parseErr := pricing.ParseDecimal(client.DailyLimitUSD)
+			if parseErr != nil || limit.IsZero() {
+				return fmt.Errorf("client %q daily_limit_usd must be a positive decimal", client.ID)
+			}
+		}
 		for _, deploymentID := range client.AllowedDeployments {
 			if _, exists := deploymentIDs[deploymentID]; !exists {
 				return fmt.Errorf("client %q allows unknown deployment %q", client.ID, deploymentID)
+			}
+			if client.DailyLimitUSD != "" && deploymentCurrencies[deploymentID] != "USD" {
+				return fmt.Errorf("client %q daily USD limit cannot include non-USD deployment %q", client.ID, deploymentID)
 			}
 		}
 	}

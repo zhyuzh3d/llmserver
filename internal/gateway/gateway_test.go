@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/zhyuzh3d/llmserver/internal/auth"
@@ -84,6 +85,31 @@ func TestHardBudgetRejectsBeforeProviderStart(t *testing.T) {
 	}
 }
 
+func TestDailyQuotaRejectsBeforeProviderStart(t *testing.T) {
+	adapter := &countingAdapter{Adapter: mock.Adapter{ProviderID: "mock", ResponseText: "ok"}}
+	repository := &quotaRejectRepository{}
+	service, err := NewService([]config.DeploymentConfig{{
+		ID: "terra", ProviderID: "mock", UpstreamModel: "mock-terra", Enabled: true,
+		Price: config.PriceConfig{Revision: "price", Currency: "USD", InputPerMillion: "2", OutputPerMillion: "12"},
+	}}, []provider.Adapter{adapter}, WithRunRepository(repository))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := auth.NewClient("device", "secret", []string{"terra"})
+	client.DailyLimitUSD = "1.00"
+	_, _, err = service.Start(context.Background(), client, Request{Model: "terra", CanonicalInput: "hello"})
+	var apiError *Error
+	if !errors.As(err, &apiError) || apiError.Status != 402 || apiError.Code != "daily_quota_exceeded" {
+		t.Fatalf("daily quota error = %#v", err)
+	}
+	if adapter.starts != 0 {
+		t.Fatalf("provider started %d times", adapter.starts)
+	}
+	if repository.reservation.DailyLimitUSD != "1.00" || repository.reservation.DayStart.IsZero() {
+		t.Fatalf("quota reservation = %#v", repository.reservation)
+	}
+}
+
 func TestPublicResponseDoesNotLeakProviderInjectedConfiguration(t *testing.T) {
 	response := publicResponse("req_abc", "luna", map[string]any{
 		"id":               "upstream-id",
@@ -107,6 +133,18 @@ type countingAdapter struct {
 	mock.Adapter
 	starts int
 }
+
+type quotaRejectRepository struct {
+	reservation RunReservation
+}
+
+func (r *quotaRejectRepository) Reserve(_ context.Context, reservation RunReservation) (StoredRun, bool, error) {
+	r.reservation = reservation
+	return StoredRun{}, false, ErrDailyQuotaExceeded
+}
+func (*quotaRejectRepository) MarkRunning(context.Context, string) error                { return nil }
+func (*quotaRejectRepository) Complete(context.Context, RunCompletion) error            { return nil }
+func (*quotaRejectRepository) MarkFailed(context.Context, string, string, string) error { return nil }
 
 func (a *countingAdapter) Start(ctx context.Context, request provider.Request) (<-chan provider.Event, error) {
 	a.starts++

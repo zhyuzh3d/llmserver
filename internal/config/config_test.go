@@ -135,6 +135,34 @@ func TestWorkBuddyWarmupSettingsAreBounded(t *testing.T) {
 	}
 }
 
+func TestDailyLimitRequiresPositiveUSDDeployments(t *testing.T) {
+	cfg := Config{
+		Version: 1,
+		Server:  ServerConfig{Listen: "127.0.0.1:4815", AdminListen: "127.0.0.1:4816"},
+		Clients: []ClientConfig{{ID: "device", Token: NewSecret("token"), AllowedDeployments: []string{"model"}, DailyLimitUSD: "10.00"}},
+		Providers: []ProviderConfig{{
+			ID: "api", Type: "openai_responses", BaseURL: "https://example.test/v1",
+			DefaultPublicPrice: PriceConfig{Revision: "default", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+		Deployments: []DeploymentConfig{{
+			ID: "model", ProviderID: "api", UpstreamModel: "upstream",
+			Price: PriceConfig{Revision: "v1", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid daily limit was rejected: %v", err)
+	}
+	cfg.Clients[0].DailyLimitUSD = "0"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "positive") {
+		t.Fatalf("zero daily limit was accepted: %v", err)
+	}
+	cfg.Clients[0].DailyLimitUSD = "10"
+	cfg.Deployments[0].Price.Currency = "CNY"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "non-USD") {
+		t.Fatalf("non-USD deployment was accepted for USD quota: %v", err)
+	}
+}
+
 func TestBootstrapCreatesDurableClientTokenWithoutInventingProviderKey(t *testing.T) {
 	dir := t.TempDir()
 	publicPath := filepath.Join(dir, "configs", "config.yaml")

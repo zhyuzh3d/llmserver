@@ -70,7 +70,7 @@ terminal_state
 
 ## 4. 模型发现与公开
 
-`model/list` 只更新 Discovered Model inventory，保存 model ID、display name、hidden、支持的 reasoning effort、输入模态和推荐默认值。它不自动创建或启用 Model Deployment。
+`model/list` 只更新 Discovered Model inventory，保存 model ID、display name、hidden、支持的 reasoning effort、输入模态和推荐默认值。它不自动创建或启用 Model Deployment。当前 Codex 目录会漏报 GPT-5.6 Luna、Terra、Sol 已验证可用的 `none`；发现层只对这三个精确模型 ID 补齐该值，未知模型不做能力推断。
 
 管理员通过配置显式建立：
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -119,5 +120,59 @@ func TestUsageSummarySeparatesPublicChargeAndActualEstimate(t *testing.T) {
 	})
 	if err != nil || len(clientReport.Groups) != 1 || clientReport.Groups[0].ID != "device" {
 		t.Fatalf("client report = %#v err=%v", clientReport.Groups, err)
+	}
+}
+
+func TestDailyQuotaBlocksNewRunsAndManualResetStartsNewWindow(t *testing.T) {
+	repository, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ctx := context.Background()
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	first := gateway.RunReservation{
+		RunID: "req_quota_one", ClientID: "limited", DeploymentID: "model", IdempotencyKey: "first", Fingerprint: "fingerprint",
+		DailyLimitUSD: "1.00", DayStart: dayStart,
+	}
+	if _, created, err := repository.Reserve(ctx, first); err != nil || !created {
+		t.Fatalf("first reserve created=%t err=%v", created, err)
+	}
+	if err := repository.MarkRunning(ctx, first.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Complete(ctx, gateway.RunCompletion{
+		RunID: first.RunID, ResponseJSON: []byte(`{"id":"resp_quota"}`), BillingJSON: []byte(`{"request_id":"req_quota_one"}`),
+		InputTokens: 1, OutputTokens: 1, InputSource: "provider_reported", OutputSource: "provider_reported",
+		PriceVersion: "public", Currency: "USD", InputUnitPrice: "1", OutputUnitPrice: "1",
+		InputCharge: "0.4", OutputCharge: "0.6", TotalCharge: "1.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := repository.DailyQuotaStatuses(ctx, []DailyQuotaSpec{{ClientID: "limited", LimitUSD: "1.00"}}, now)
+	if err != nil || len(statuses) != 1 || statuses[0].UsedUSD != "1.000000000" || statuses[0].RemainingUSD != "0.000000000" {
+		t.Fatalf("daily status = %#v err=%v", statuses, err)
+	}
+	blocked := gateway.RunReservation{RunID: "req_quota_two", ClientID: "limited", DeploymentID: "model", Fingerprint: "second", DailyLimitUSD: "1.00", DayStart: dayStart}
+	if _, _, err := repository.Reserve(ctx, blocked); !errors.Is(err, gateway.ErrDailyQuotaExceeded) {
+		t.Fatalf("over-quota reserve error = %v", err)
+	}
+	if record, created, err := repository.Reserve(ctx, gateway.RunReservation{
+		RunID: "req_retry", ClientID: "limited", DeploymentID: "model", IdempotencyKey: "first", Fingerprint: "fingerprint",
+		DailyLimitUSD: "1.00", DayStart: dayStart,
+	}); err != nil || created || record.RunID != first.RunID {
+		t.Fatalf("idempotent retry record=%#v created=%t err=%v", record, created, err)
+	}
+	resetAt := time.Now()
+	if err := repository.ResetDailyQuota(ctx, "limited", resetAt); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = repository.DailyQuotaStatuses(ctx, []DailyQuotaSpec{{ClientID: "limited", LimitUSD: "1.00"}}, resetAt)
+	if err != nil || statuses[0].UsedUSD != "0.000000000" || statuses[0].RemainingUSD != "1.000000000" {
+		t.Fatalf("reset status = %#v err=%v", statuses, err)
+	}
+	if _, created, err := repository.Reserve(ctx, blocked); err != nil || !created {
+		t.Fatalf("post-reset reserve created=%t err=%v", created, err)
 	}
 }

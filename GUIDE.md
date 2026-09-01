@@ -68,7 +68,7 @@ curl "$LLMSERVER_BASE_URL/v1/responses" \
 - `input`：必填，推荐使用字符串；
 - `instructions`：可选，推荐使用字符串；
 - `stream`：可选，默认 `false`；
-- `reasoning.effort`：可选推理强度；是否支持、允许值及是否能真正降低思考由模型决定。调用方不掌握当前模型能力时应省略，不要默认填写 `low`；
+- `reasoning.effort`：可选推理强度；是否支持、允许值及是否能真正降低思考由模型决定。`codex-luna`、`codex-terra`、`codex-sol` 支持显式传入 `none`；省略时使用服务端配置的默认档位。调用方不掌握其他模型能力时应省略，不要默认填写 `low`；
 - `max_output_tokens`：可选正整数；部分模型不保证严格限制，要求价格硬上限时应同时使用 `hard` 预算；
 - `store`：只能省略或设为 `false`，`true` 会被拒绝；
 - `llmserver`：可选的预算与幂等扩展。
@@ -273,6 +273,7 @@ x-llmserver-compatibility: strict
 | 400 | `unsupported_reasoning_effort` | 当前模型不支持请求的推理强度 |
 | 401 | `invalid_api_key` | Token 缺失、错误或已被替换 |
 | 402 | `budget_exceeded_before_start` | 硬预算调用前检查未通过 |
+| 402 | `daily_quota_exceeded` | 访问 Token 当日可用的平台价额度已经用完 |
 | 403 | `model_not_allowed` | 此 Token 未获准使用该模型 |
 | 404 | `unknown_model_deployment` | 公开模型不存在或已停用 |
 | 409 | `idempotency_key_reused` / `idempotency_in_progress` | 幂等冲突或原请求未完成 |

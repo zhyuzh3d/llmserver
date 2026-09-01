@@ -13,6 +13,7 @@ clients:
         - codex-terra
         - codex-sol
         - workbuddy-hy4-preview
+      daily_limit_usd: "20.00"
 providers:
     - id: api-openai
       type: openai_responses
@@ -134,6 +135,7 @@ deployments:
       provider_id: codex-local
       upstream_model: gpt-5.6-luna
       supported_reasoning_efforts:
+        - none
         - low
         - medium
         - high
@@ -151,6 +153,7 @@ deployments:
       provider_id: codex-local
       upstream_model: gpt-5.6-terra
       supported_reasoning_efforts:
+        - none
         - low
         - medium
         - high
@@ -169,6 +172,7 @@ deployments:
       provider_id: codex-local
       upstream_model: gpt-5.6-sol
       supported_reasoning_efforts:
+        - none
         - low
         - medium
         - high

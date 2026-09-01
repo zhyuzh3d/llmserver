@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhyuzh3d/llmserver/internal/config"
 	"github.com/zhyuzh3d/llmserver/internal/discovery"
 	"github.com/zhyuzh3d/llmserver/internal/runtimecfg"
 	"github.com/zhyuzh3d/llmserver/internal/store"
@@ -45,6 +46,7 @@ func New(manager *runtimecfg.Manager, runStore *store.SQLite) *Server {
 	server.mux.HandleFunc("POST /admin/api/providers/{providerID}/models", server.handleDiscoverModels)
 	server.mux.HandleFunc("GET /admin/api/usage", server.handleUsage)
 	server.mux.HandleFunc("POST /admin/api/tokens/generate", server.handleGenerateToken)
+	server.mux.HandleFunc("POST /admin/api/clients/{clientID}/daily-quota/reset", server.handleDailyQuotaReset)
 	return server
 }
 
@@ -59,13 +61,61 @@ func (s *Server) Handler() http.Handler {
 	})))
 }
 
-func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	snapshot := s.manager.Snapshot()
 	if snapshot == nil {
 		writeError(w, http.StatusServiceUnavailable, "runtime is not ready")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"config": snapshot.Config, "secret_status": s.manager.SecretStatus()})
+	ctx, cancel := contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+	quotas, err := s.store.DailyQuotaStatuses(ctx, dailyQuotaSpecs(snapshot.Config.Clients), time.Now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read daily quota status")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config": snapshot.Config, "secret_status": s.manager.SecretStatus(), "daily_quotas": quotas})
+}
+
+func dailyQuotaSpecs(clients []config.ClientConfig) []store.DailyQuotaSpec {
+	result := make([]store.DailyQuotaSpec, 0, len(clients))
+	for _, client := range clients {
+		result = append(result, store.DailyQuotaSpec{ClientID: client.ID, LimitUSD: client.DailyLimitUSD})
+	}
+	return result
+}
+
+func (s *Server) handleDailyQuotaReset(w http.ResponseWriter, r *http.Request) {
+	snapshot := s.manager.Snapshot()
+	if snapshot == nil {
+		writeError(w, http.StatusServiceUnavailable, "runtime is not ready")
+		return
+	}
+	clientID := r.PathValue("clientID")
+	var client *config.ClientConfig
+	for i := range snapshot.Config.Clients {
+		if snapshot.Config.Clients[i].ID == clientID {
+			client = &snapshot.Config.Clients[i]
+			break
+		}
+	}
+	if client == nil {
+		writeError(w, http.StatusNotFound, "access key not found")
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	if err := s.store.ResetDailyQuota(ctx, clientID, now); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not reset daily quota")
+		return
+	}
+	statuses, err := s.store.DailyQuotaStatuses(ctx, []store.DailyQuotaSpec{{ClientID: client.ID, LimitUSD: client.DailyLimitUSD}}, now)
+	if err != nil || len(statuses) != 1 {
+		writeError(w, http.StatusInternalServerError, "could not read reset daily quota")
+		return
+	}
+	writeJSON(w, http.StatusOK, statuses[0])
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, _ *http.Request) {

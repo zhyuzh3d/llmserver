@@ -3,7 +3,11 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"time"
 )
+
+var ErrDailyQuotaExceeded = errors.New("daily quota exceeded")
 
 type RunRepository interface {
 	Reserve(context.Context, RunReservation) (StoredRun, bool, error)
@@ -18,6 +22,8 @@ type RunReservation struct {
 	DeploymentID   string
 	IdempotencyKey string
 	Fingerprint    string
+	DailyLimitUSD  string
+	DayStart       time.Time
 }
 
 type StoredRun struct {

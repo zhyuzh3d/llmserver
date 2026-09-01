@@ -140,8 +140,13 @@ dialog::backdrop { background: rgba(12,25,19,.47); backdrop-filter: blur(3px); }
 .key-card details { border-top: 1px solid var(--line); }
 .key-card summary { padding: 10px 17px; cursor: pointer; color: #4f5c55; background: #f8faf8; font-size: 10px; font-weight: 700; }
 .key-card summary span { margin-left: 6px; color: #89948e; font-weight: 500; }
-.key-settings { padding: 15px 17px; display: grid; grid-template-columns: 240px 1fr; gap: 14px; align-items: end; }
-.permission-grid { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); }
+.key-settings { padding: 15px 17px; }
+.key-quota-row { display: grid; grid-template-columns: minmax(180px, 1fr) 150px minmax(190px, .75fr) auto; gap: 12px; align-items: end; }
+.daily-usage { min-width: 0; display: grid; gap: 3px; padding-bottom: 2px; }
+.daily-usage > span { color: #5c6862; font-size: 9px; font-weight: 700; }
+.daily-usage strong { overflow: hidden; color: var(--ink); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.daily-usage small { color: #89948e; font-size: 8px; }
+.permission-grid { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; }
 .permission-grid label { display: flex; max-width: 220px; min-width: 0; align-items: center; gap: 5px; padding: 5px 7px; overflow: hidden; border-radius: 5px; color: #53605a; background: #f2f6f3; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .permission-grid input { flex: none; }
 .usage-toolbar { margin-bottom: 16px; display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
@@ -171,6 +176,10 @@ dialog::backdrop { background: rgba(12,25,19,.47); backdrop-filter: blur(3px); }
   .provider-grid, .usage-summary-grid { grid-template-columns: 1fr 1fr; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
   .usage-toolbar { align-items: flex-start; flex-direction: column; }
+}
+@media (max-width: 820px) {
+  .key-quota-row { grid-template-columns: 1fr 150px; }
+  .daily-usage { grid-column: 1 / 2; }
 }
 @media (prefers-reduced-motion: reduce) {
   .toast { transition: none; }

@@ -103,6 +103,31 @@ func (s *SQLite) Reserve(ctx context.Context, reservation gateway.RunReservation
 			return record, false, nil
 		}
 	}
+	if reservation.DailyLimitUSD != "" {
+		limit, parseErr := pricing.ParseDecimal(reservation.DailyLimitUSD)
+		if parseErr != nil || limit.IsZero() {
+			return gateway.StoredRun{}, false, errors.New("invalid daily quota limit")
+		}
+		windowStart := reservation.DayStart
+		if windowStart.IsZero() {
+			now := time.Now()
+			windowStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		}
+		resetAt, found, resetErr := latestDailyQuotaReset(ctx, tx, reservation.ClientID)
+		if resetErr != nil {
+			return gateway.StoredRun{}, false, resetErr
+		}
+		if found && resetAt.After(windowStart) {
+			windowStart = resetAt
+		}
+		used, usageErr := dailyQuotaUsed(ctx, tx, reservation.ClientID, windowStart)
+		if usageErr != nil {
+			return gateway.StoredRun{}, false, usageErr
+		}
+		if used.Nanos() >= limit.Nanos() {
+			return gateway.StoredRun{}, false, gateway.ErrDailyQuotaExceeded
+		}
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = tx.ExecContext(ctx, `
@@ -125,6 +150,126 @@ func (s *SQLite) Reserve(ctx context.Context, reservation gateway.RunReservation
 		return gateway.StoredRun{}, false, err
 	}
 	return gateway.StoredRun{RunID: reservation.RunID, Status: "accepted", SettlementState: "pending", Fingerprint: reservation.Fingerprint}, true, nil
+}
+
+type dailyQuotaQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func latestDailyQuotaReset(ctx context.Context, query dailyQuotaQuerier, clientID string) (time.Time, bool, error) {
+	var raw string
+	err := query.QueryRowContext(ctx, `SELECT reset_at FROM client_daily_quota_resets WHERE client_id = ?`, clientID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse daily quota reset: %w", err)
+	}
+	return value, true, nil
+}
+
+func dailyQuotaUsed(ctx context.Context, query dailyQuotaQuerier, clientID string, since time.Time) (pricing.Decimal, error) {
+	rows, err := query.QueryContext(ctx, `
+		SELECT r.created_at, rc.total_charge
+		FROM runs r JOIN run_charges rc ON rc.run_id = r.id
+		WHERE r.client_id = ? AND r.status = 'completed' AND r.settlement_status = 'confirmed'
+		  AND UPPER(rc.currency) = 'USD' AND julianday(r.created_at) >= julianday(?)
+		ORDER BY r.created_at`, clientID, since.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return pricing.Decimal{}, err
+	}
+	defer rows.Close()
+	total, _ := pricing.DecimalFromNanos(0)
+	for rows.Next() {
+		var createdRaw, chargeRaw string
+		if err := rows.Scan(&createdRaw, &chargeRaw); err != nil {
+			return pricing.Decimal{}, err
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, createdRaw)
+		if err != nil {
+			return pricing.Decimal{}, fmt.Errorf("parse daily quota run time: %w", err)
+		}
+		if createdAt.Before(since) {
+			continue
+		}
+		value, err := pricing.ParseDecimal(chargeRaw)
+		if err != nil {
+			return pricing.Decimal{}, fmt.Errorf("parse daily quota charge: %w", err)
+		}
+		total, err = total.Add(value)
+		if err != nil {
+			return pricing.Decimal{}, err
+		}
+	}
+	return total, rows.Err()
+}
+
+type DailyQuotaSpec struct {
+	ClientID string
+	LimitUSD string
+}
+
+type DailyQuotaStatus struct {
+	ClientID     string `json:"client_id"`
+	LimitUSD     string `json:"limit_usd,omitempty"`
+	UsedUSD      string `json:"used_usd"`
+	RemainingUSD string `json:"remaining_usd,omitempty"`
+	WindowStart  string `json:"window_start"`
+	ResetsAt     string `json:"resets_at"`
+}
+
+func (s *SQLite) DailyQuotaStatuses(ctx context.Context, specs []DailyQuotaSpec, now time.Time) ([]DailyQuotaStatus, error) {
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	nextReset := dayStart.AddDate(0, 0, 1)
+	statuses := make([]DailyQuotaStatus, 0, len(specs))
+	for _, spec := range specs {
+		windowStart := dayStart
+		resetAt, found, err := latestDailyQuotaReset(ctx, s.db, spec.ClientID)
+		if err != nil {
+			return nil, err
+		}
+		if found && resetAt.After(windowStart) {
+			windowStart = resetAt
+		}
+		used, err := dailyQuotaUsed(ctx, s.db, spec.ClientID, windowStart)
+		if err != nil {
+			return nil, err
+		}
+		status := DailyQuotaStatus{
+			ClientID: spec.ClientID, LimitUSD: spec.LimitUSD, UsedUSD: used.String(),
+			WindowStart: windowStart.Format(time.RFC3339Nano), ResetsAt: nextReset.Format(time.RFC3339Nano),
+		}
+		if spec.LimitUSD != "" {
+			limit, parseErr := pricing.ParseDecimal(spec.LimitUSD)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			remainingNanos := limit.Nanos() - used.Nanos()
+			if remainingNanos < 0 {
+				remainingNanos = 0
+			}
+			remaining, _ := pricing.DecimalFromNanos(remainingNanos)
+			status.RemainingUSD = remaining.String()
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}
+
+func (s *SQLite) ResetDailyQuota(ctx context.Context, clientID string, at time.Time) error {
+	if strings.TrimSpace(clientID) == "" {
+		return errors.New("client id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO client_daily_quota_resets(client_id, reset_at) VALUES(?, ?)
+		ON CONFLICT(client_id) DO UPDATE SET reset_at = excluded.reset_at`,
+		clientID, at.UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func lookupIdempotency(ctx context.Context, tx *sql.Tx, clientID, key string) (gateway.StoredRun, bool, error) {
@@ -695,6 +840,11 @@ CREATE TABLE IF NOT EXISTS run_charges (
     output_charge TEXT NOT NULL,
     total_charge TEXT NOT NULL,
     budget_json BLOB
+);
+
+CREATE TABLE IF NOT EXISTS client_daily_quota_resets (
+    client_id TEXT PRIMARY KEY,
+    reset_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS upstream_cost_records (

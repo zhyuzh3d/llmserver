@@ -12,6 +12,7 @@ import (
 type Client struct {
 	ID                 string
 	AllowedDeployments map[string]struct{}
+	DailyLimitUSD      string
 	tokenHash          [sha256.Size]byte
 }
 
@@ -28,7 +29,9 @@ func FromConfig(clients []config.ClientConfig) (*Authenticator, error) {
 	result := &Authenticator{}
 	for _, clientConfig := range clients {
 		token := clientConfig.Token.Reveal()
-		result.clients = append(result.clients, NewClient(clientConfig.ID, token, clientConfig.AllowedDeployments))
+		client := NewClient(clientConfig.ID, token, clientConfig.AllowedDeployments)
+		client.DailyLimitUSD = clientConfig.DailyLimitUSD
+		result.clients = append(result.clients, client)
 	}
 	return result, nil
 }
