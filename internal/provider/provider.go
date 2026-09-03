@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/zhyuzh3d/llmserver/internal/pricing"
+	"github.com/zhyuzh3d/llmserver/internal/toolcall"
 )
 
 type Request struct {
@@ -17,6 +18,7 @@ type Request struct {
 	MaxOutputTokens *int64
 	ReasoningEffort string
 	RawRequest      json.RawMessage
+	ToolCall        *toolcall.Request
 }
 
 type EventType string

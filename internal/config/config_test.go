@@ -105,6 +105,33 @@ func TestSystemProviderPerformanceSettingsMustMatchDeployment(t *testing.T) {
 	}
 }
 
+func TestFunctionCallingCapabilityIsExplicitAndWorkBuddyCannotClaimNative(t *testing.T) {
+	cfg := Config{
+		Version: 1,
+		Server:  ServerConfig{Listen: "127.0.0.1:4815", AdminListen: "127.0.0.1:4816"},
+		Clients: []ClientConfig{{ID: "device", Token: NewSecret("token"), AllowedDeployments: []string{"model"}}},
+		Providers: []ProviderConfig{{
+			ID: "workbuddy", Type: "workbuddy_exec", Executable: "/bin/true",
+			DefaultPublicPrice: PriceConfig{Revision: "default", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+		Deployments: []DeploymentConfig{{
+			ID: "model", ProviderID: "workbuddy", UpstreamModel: "hy4-preview", FunctionCalling: "native",
+			Price: PriceConfig{Revision: "v1", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "2"},
+		}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot enable native") {
+		t.Fatalf("WorkBuddy native function calling was accepted: %v", err)
+	}
+	cfg.Deployments[0].FunctionCalling = "emulated"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("honest emulated capability marker was rejected: %v", err)
+	}
+	cfg.Deployments[0].FunctionCalling = "invented"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "function_calling") {
+		t.Fatalf("unknown function capability was accepted: %v", err)
+	}
+}
+
 func TestWorkBuddyWarmupSettingsAreBounded(t *testing.T) {
 	provider := ProviderConfig{
 		ID: "workbuddy", Type: "workbuddy_exec", Executable: "/bin/true", MaxConcurrency: 2,

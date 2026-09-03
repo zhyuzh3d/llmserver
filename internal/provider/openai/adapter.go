@@ -175,6 +175,11 @@ func buildRequestBody(request provider.Request) ([]byte, bool, error) {
 	}
 	body["model"] = model
 	delete(body, "llmserver")
+	if request.ToolCall != nil && request.ToolCall.Enabled() {
+		body["tools"] = request.ToolCall.Tools
+		body["tool_choice"] = request.ToolCall.ToolChoice
+		body["parallel_tool_calls"] = json.RawMessage("false")
+	}
 	var streaming bool
 	if raw, ok := body["stream"]; ok {
 		if err := json.Unmarshal(raw, &streaming); err != nil {

@@ -407,6 +407,8 @@ type ActualUsage struct {
 type UsageReportFilter struct {
 	Since                time.Time
 	Until                time.Time
+	BucketDuration       time.Duration
+	PublicOnly           bool
 	GroupBy              string
 	ProviderID           string
 	ClientID             string
@@ -414,10 +416,24 @@ type UsageReportFilter struct {
 }
 
 type UsageReport struct {
-	Since   string       `json:"since"`
-	Until   string       `json:"until"`
-	GroupBy string       `json:"group_by"`
-	Groups  []UsageGroup `json:"groups"`
+	Since         string              `json:"since"`
+	Until         string              `json:"until"`
+	GroupBy       string              `json:"group_by"`
+	BucketMinutes int                 `json:"bucket_minutes,omitempty"`
+	Groups        []UsageGroup        `json:"groups"`
+	PublicSeries  []PublicUsageSeries `json:"public_series,omitempty"`
+}
+
+type PublicUsageSeries struct {
+	DeploymentID string             `json:"deployment_id"`
+	Unit         string             `json:"unit"`
+	Total        string             `json:"total"`
+	Points       []PublicUsagePoint `json:"points"`
+}
+
+type PublicUsagePoint struct {
+	Start string `json:"start"`
+	Total string `json:"total"`
 }
 
 type UsageGroup struct {
@@ -574,6 +590,13 @@ type reportModel struct {
 	actual       map[string]pricing.Decimal
 }
 
+type reportPublicSeries struct {
+	deploymentID string
+	unit         string
+	total        pricing.Decimal
+	points       []pricing.Decimal
+}
+
 func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (UsageReport, error) {
 	if filter.GroupBy != "provider" && filter.GroupBy != "client" {
 		return UsageReport{}, errors.New("usage report group_by must be provider or client")
@@ -586,19 +609,29 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 	}
 	report := UsageReport{Since: filter.Since.UTC().Format(time.RFC3339Nano), Until: filter.Until.UTC().Format(time.RFC3339Nano), GroupBy: filter.GroupBy}
 	buckets := map[string]*reportBucket{}
+	publicSeries := map[string]*reportPublicSeries{}
+	if filter.BucketDuration > 0 {
+		if filter.GroupBy != "client" {
+			return report, errors.New("usage time series is only supported for client reports")
+		}
+		if filter.BucketDuration > filter.Until.Sub(filter.Since) {
+			return report, errors.New("usage time-series bucket exceeds the report window")
+		}
+		report.BucketMinutes = int(filter.BucketDuration / time.Minute)
+	}
 
 	publicRows, err := s.db.QueryContext(ctx, `
-		SELECT r.id, r.client_id, r.deployment_id, ru.input_tokens, ru.output_tokens, rc.currency, rc.total_charge
+		SELECT r.id, r.client_id, r.deployment_id, ru.input_tokens, ru.output_tokens, rc.currency, rc.total_charge, r.updated_at
 		FROM runs r JOIN run_usage ru ON ru.run_id = r.id JOIN run_charges rc ON rc.run_id = r.id
-		WHERE r.status = 'completed' AND r.settlement_status = 'confirmed' AND r.created_at >= ? AND r.created_at < ?
-		ORDER BY r.created_at`, report.Since, report.Until)
+		WHERE r.status = 'completed' AND r.settlement_status = 'confirmed' AND r.updated_at >= ? AND r.updated_at < ?
+		ORDER BY r.updated_at`, report.Since, report.Until)
 	if err != nil {
 		return report, err
 	}
 	for publicRows.Next() {
-		var runID, clientID, deploymentID, currency, total string
+		var runID, clientID, deploymentID, currency, total, settledAt string
 		var inputTokens, outputTokens int64
-		if err := publicRows.Scan(&runID, &clientID, &deploymentID, &inputTokens, &outputTokens, &currency, &total); err != nil {
+		if err := publicRows.Scan(&runID, &clientID, &deploymentID, &inputTokens, &outputTokens, &currency, &total, &settledAt); err != nil {
 			publicRows.Close()
 			return report, err
 		}
@@ -629,6 +662,12 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 			publicRows.Close()
 			return report, err
 		}
+		if filter.BucketDuration > 0 {
+			if err := addPublicSeriesValue(publicSeries, filter, deploymentID, currency, total, settledAt); err != nil {
+				publicRows.Close()
+				return report, err
+			}
+		}
 	}
 	if err := publicRows.Err(); err != nil {
 		publicRows.Close()
@@ -636,6 +675,11 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 	}
 	if err := publicRows.Close(); err != nil {
 		return report, err
+	}
+	if filter.PublicOnly {
+		report.Groups = renderReportBuckets(buckets)
+		report.PublicSeries = renderPublicSeries(publicSeries, filter)
+		return report, nil
 	}
 
 	actualRows, err := s.db.QueryContext(ctx, `
@@ -690,7 +734,66 @@ func (s *SQLite) UsageReport(ctx context.Context, filter UsageReportFilter) (Usa
 	}
 
 	report.Groups = renderReportBuckets(buckets)
+	report.PublicSeries = renderPublicSeries(publicSeries, filter)
 	return report, nil
+}
+
+func addPublicSeriesValue(series map[string]*reportPublicSeries, filter UsageReportFilter, deploymentID, unit, rawTotal, rawTime string) error {
+	settledAt, err := time.Parse(time.RFC3339Nano, rawTime)
+	if err != nil {
+		return fmt.Errorf("parse run settlement time: %w", err)
+	}
+	index := int(settledAt.Sub(filter.Since) / filter.BucketDuration)
+	count := int((filter.Until.Sub(filter.Since) + filter.BucketDuration - 1) / filter.BucketDuration)
+	if index < 0 || index >= count {
+		return nil
+	}
+	key := deploymentID + "\x00" + unit
+	item := series[key]
+	if item == nil {
+		item = &reportPublicSeries{deploymentID: deploymentID, unit: unit, points: make([]pricing.Decimal, count)}
+		series[key] = item
+	}
+	value, err := pricing.ParseDecimal(rawTotal)
+	if err != nil {
+		return err
+	}
+	item.total, err = item.total.Add(value)
+	if err != nil {
+		return err
+	}
+	item.points[index], err = item.points[index].Add(value)
+	return err
+}
+
+func renderPublicSeries(source map[string]*reportPublicSeries, filter UsageReportFilter) []PublicUsageSeries {
+	if filter.BucketDuration <= 0 {
+		return nil
+	}
+	items := make([]*reportPublicSeries, 0, len(source))
+	for _, item := range source {
+		if !item.total.IsZero() {
+			items = append(items, item)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].unit != items[j].unit {
+			return items[i].unit < items[j].unit
+		}
+		if items[i].total.Nanos() != items[j].total.Nanos() {
+			return items[i].total.Nanos() > items[j].total.Nanos()
+		}
+		return items[i].deploymentID < items[j].deploymentID
+	})
+	result := make([]PublicUsageSeries, 0, len(items))
+	for _, item := range items {
+		row := PublicUsageSeries{DeploymentID: item.deploymentID, Unit: item.unit, Total: item.total.String(), Points: make([]PublicUsagePoint, len(item.points))}
+		for index, value := range item.points {
+			row.Points[index] = PublicUsagePoint{Start: filter.Since.Add(time.Duration(index) * filter.BucketDuration).UTC().Format(time.RFC3339Nano), Total: value.String()}
+		}
+		result = append(result, row)
+	}
+	return result
 }
 
 func reportRunMatches(filter UsageReportFilter, clientID, providerID string) bool {
@@ -807,6 +910,7 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_client_created_idx ON runs(client_id, created_at);
+CREATE INDEX IF NOT EXISTS runs_client_updated_idx ON runs(client_id, updated_at);
 CREATE INDEX IF NOT EXISTS runs_deployment_status_idx ON runs(deployment_id, status);
 CREATE INDEX IF NOT EXISTS runs_status_created_idx ON runs(status, created_at);
 

@@ -13,7 +13,7 @@ clients:
         - codex-terra
         - codex-sol
         - workbuddy-hy4-preview
-      daily_limit_usd: "20.00"
+      daily_limit_usd: "50.00"
 providers:
     - id: api-openai
       type: openai_responses
@@ -69,6 +69,7 @@ deployments:
         - high
         - xhigh
         - max
+      function_calling: native
       price:
         revision: luna-public-v1
         currency: USD
@@ -93,6 +94,7 @@ deployments:
         - high
         - xhigh
         - max
+      function_calling: native
       price:
         revision: terra-public-v1
         currency: USD
@@ -117,6 +119,7 @@ deployments:
         - high
         - xhigh
         - max
+      function_calling: native
       price:
         revision: sol-public-v1
         currency: USD
@@ -141,6 +144,7 @@ deployments:
         - high
         - xhigh
         - max
+      function_calling: native
       price:
         revision: codex-luna-public-v1
         currency: USD
@@ -160,6 +164,7 @@ deployments:
         - xhigh
         - max
         - ultra
+      function_calling: native
       price:
         revision: codex-terra-public-v1
         currency: USD
@@ -179,6 +184,7 @@ deployments:
         - xhigh
         - max
         - ultra
+      function_calling: native
       price:
         revision: codex-sol-public-v1
         currency: USD
@@ -192,6 +198,7 @@ deployments:
       upstream_model: hy4-preview
       supported_reasoning_efforts:
         - high
+      function_calling: unsupported
       price:
         revision: workbuddy-hy4-preview-public-v1
         currency: USD

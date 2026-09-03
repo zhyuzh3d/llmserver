@@ -11,6 +11,7 @@ import (
 
 	"github.com/zhyuzh3d/llmserver/internal/config"
 	"github.com/zhyuzh3d/llmserver/internal/provider"
+	"github.com/zhyuzh3d/llmserver/internal/toolcall"
 )
 
 func TestNonStreamingRequestIsSanitizedAndUsageIsRead(t *testing.T) {
@@ -90,6 +91,42 @@ func TestStreamingResponseProducesDeltasAndCompletion(t *testing.T) {
 	}
 	if deltas.String() != "hello" || final == nil || final.OutputText != "hello" {
 		t.Fatalf("deltas=%q final=%#v", deltas.String(), final)
+	}
+}
+
+func TestNativeFunctionContractIsForwardedAndReturned(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		tools, _ := body["tools"].([]any)
+		if len(tools) != 1 || body["tool_choice"] != "required" || body["parallel_tool_calls"] != false {
+			t.Fatalf("function contract was not normalized: %#v", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"city\\\":\\\"上\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"upstream\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"上海\\\"}\"}],\"usage\":{\"input_tokens\":30,\"output_tokens\":8}}}\n\n")
+	}))
+	defer upstream.Close()
+	tools, err := toolcall.Parse(json.RawMessage(`[{"type":"function","name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true}]`), json.RawMessage(`"required"`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New("api", upstream.URL, config.NewSecret("secret"), upstream.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := adapter.Start(context.Background(), provider.Request{
+		UpstreamModel: "upstream", ToolCall: tools,
+		RawRequest: json.RawMessage(`{"model":"public","input":"weather","stream":true,"tools":[],"tool_choice":"none","parallel_tool_calls":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := completedEvent(t, events)
+	if err := tools.ValidateResponse(final.Response); err != nil {
+		t.Fatal(err)
 	}
 }
 

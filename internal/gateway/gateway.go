@@ -18,6 +18,7 @@ import (
 	"github.com/zhyuzh3d/llmserver/internal/config"
 	"github.com/zhyuzh3d/llmserver/internal/pricing"
 	"github.com/zhyuzh3d/llmserver/internal/provider"
+	"github.com/zhyuzh3d/llmserver/internal/toolcall"
 )
 
 type Service struct {
@@ -36,10 +37,12 @@ type Deployment struct {
 	ReasoningEfforts    map[string]struct{}
 	Enabled             bool
 	HardBudgetSupported bool
+	FunctionCalling     string
 }
 
 type Model struct {
-	ID string `json:"id"`
+	ID              string `json:"id"`
+	FunctionCalling string `json:"function_calling"`
 }
 
 type Request struct {
@@ -52,6 +55,7 @@ type Request struct {
 	RawRequest      json.RawMessage
 	Budget          *BudgetRequest
 	IdempotencyKey  string
+	ToolCall        *toolcall.Request
 }
 
 type BudgetRequest struct {
@@ -158,6 +162,7 @@ func NewService(deployments []config.DeploymentConfig, adapters []provider.Adapt
 			ReasoningEfforts:    make(map[string]struct{}, len(item.SupportedReasoningEffort)),
 			Enabled:             item.Enabled,
 			HardBudgetSupported: item.HardBudgetSupported,
+			FunctionCalling:     normalizedFunctionCalling(item.FunctionCalling),
 		}
 		for _, effort := range item.SupportedReasoningEffort {
 			deployment.ReasoningEfforts[effort] = struct{}{}
@@ -196,7 +201,7 @@ func (s *Service) Models(client *auth.Client) []Model {
 	models := make([]Model, 0, len(s.deployments))
 	for _, deployment := range s.deployments {
 		if deployment.Enabled && client.Allows(deployment.ID) {
-			models = append(models, Model{ID: deployment.ID})
+			models = append(models, Model{ID: deployment.ID, FunctionCalling: deployment.FunctionCalling})
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
@@ -236,6 +241,9 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 		if _, supported := deployment.ReasoningEfforts[request.ReasoningEffort]; !supported {
 			return nil, "", &Error{Status: http.StatusBadRequest, Code: "unsupported_reasoning_effort", Message: "reasoning effort is not supported by this deployment"}
 		}
+	}
+	if request.ToolCall != nil && request.ToolCall.Enabled() && deployment.FunctionCalling != toolcall.CapabilityNative {
+		return nil, "", &Error{Status: http.StatusUnprocessableEntity, Code: "function_call_not_supported", Message: "this model deployment does not support native function calling"}
 	}
 	runID, err := newRunID()
 	if err != nil {
@@ -319,6 +327,7 @@ func (s *Service) Start(ctx context.Context, client *auth.Client, request Reques
 		MaxOutputTokens: request.MaxOutputTokens,
 		ReasoningEffort: request.ReasoningEffort,
 		RawRequest:      request.RawRequest,
+		ToolCall:        request.ToolCall,
 	})
 	if err != nil {
 		cancelProvider()
@@ -373,7 +382,24 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 				if outputText == "" {
 					outputText = output.String()
 				}
-				usage, err := pricing.ResolveUsage(event.Final.Usage, request.CanonicalInput, outputText)
+				if request.ToolCall != nil && request.ToolCall.Enabled() {
+					if event.Final.Response == nil {
+						s.markFailed(runID, "unconfirmed", "invalid_provider_tool_call")
+						send(ctx, events, Event{Type: EventRunFailed, Error: &Error{Status: http.StatusBadGateway, Code: "invalid_provider_tool_call", Message: "provider did not return a verifiable Responses output", RequestID: runID}})
+						return
+					}
+					if err := request.ToolCall.ValidateResponse(event.Final.Response); err != nil {
+						s.markFailed(runID, "unconfirmed", "invalid_provider_tool_call")
+						slog.Warn("provider returned an invalid function call", "request_id", runID, "deployment", deployment.ID)
+						send(ctx, events, Event{Type: EventRunFailed, Error: &Error{Status: http.StatusBadGateway, Code: "invalid_provider_tool_call", Message: "provider returned an invalid function call", RequestID: runID}})
+						return
+					}
+				}
+				usageOutput := outputText
+				if usageOutput == "" && event.Final.Response != nil {
+					usageOutput = toolcall.EstimatedOutputText(event.Final.Response)
+				}
+				usage, err := pricing.ResolveUsage(event.Final.Usage, request.CanonicalInput, usageOutput)
 				if err != nil {
 					return
 				}
@@ -442,6 +468,13 @@ func (s *Service) consume(ctx context.Context, cancel context.CancelFunc, events
 			}
 		}
 	}
+}
+
+func normalizedFunctionCalling(value string) string {
+	if value == "" {
+		return toolcall.CapabilityUnsupported
+	}
+	return value
 }
 
 func logRunTiming(status, runID string, deployment Deployment, startedAt, providerStartedAt, firstDeltaAt time.Time) {

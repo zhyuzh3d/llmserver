@@ -205,6 +205,23 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "group_by must be provider or client")
 		return
 	}
+	var bucketDuration time.Duration
+	if raw := r.URL.Query().Get("bucket_minutes"); raw != "" {
+		minutes, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || (minutes != 5 && minutes != 10 && minutes != 30 && minutes != 60) {
+			writeError(w, http.StatusBadRequest, "bucket_minutes must be 5, 10, 30, or 60")
+			return
+		}
+		if groupBy != "client" {
+			writeError(w, http.StatusBadRequest, "time-series buckets are only supported for client usage")
+			return
+		}
+		bucketDuration = time.Duration(minutes) * time.Minute
+		if duration/bucketDuration > 288 {
+			writeError(w, http.StatusBadRequest, "time-series window has too many buckets")
+			return
+		}
+	}
 	snapshot := s.manager.Snapshot()
 	if snapshot == nil {
 		writeError(w, http.StatusServiceUnavailable, "runtime is not ready")
@@ -215,8 +232,11 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		providers[deployment.ID] = deployment.ProviderID
 	}
 	until := time.Now().UTC()
+	if bucketDuration > 0 {
+		until = until.Truncate(bucketDuration).Add(bucketDuration)
+	}
 	summary, err := s.store.UsageReport(ctx, store.UsageReportFilter{
-		Since: until.Add(-duration), Until: until, GroupBy: groupBy,
+		Since: until.Add(-duration), Until: until, BucketDuration: bucketDuration, PublicOnly: groupBy == "client" && bucketDuration > 0, GroupBy: groupBy,
 		ProviderID: r.URL.Query().Get("provider_id"), ClientID: r.URL.Query().Get("client_id"),
 		ProviderByDeployment: providers,
 	})

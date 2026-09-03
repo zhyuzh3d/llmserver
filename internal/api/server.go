@@ -14,6 +14,7 @@ import (
 	"github.com/zhyuzh3d/llmserver/internal/auth"
 	"github.com/zhyuzh3d/llmserver/internal/gateway"
 	"github.com/zhyuzh3d/llmserver/internal/pricing"
+	"github.com/zhyuzh3d/llmserver/internal/toolcall"
 )
 
 const maxRequestBytes = 10 << 20
@@ -39,17 +40,18 @@ func NewDynamicServer(runtime func() (*auth.Authenticator, *gateway.Service)) *S
 func (s *Server) Handler() http.Handler { return s.mux }
 
 type responsesRequest struct {
-	Model           string          `json:"model"`
-	Instructions    json.RawMessage `json:"instructions"`
-	Input           json.RawMessage `json:"input"`
-	Stream          bool            `json:"stream"`
-	MaxOutputTokens *int64          `json:"max_output_tokens"`
-	Reasoning       json.RawMessage `json:"reasoning"`
-	Tools           json.RawMessage `json:"tools"`
-	ToolChoice      json.RawMessage `json:"tool_choice"`
-	Store           *bool           `json:"store"`
-	Metadata        json.RawMessage `json:"metadata"`
-	LLMServer       struct {
+	Model             string          `json:"model"`
+	Instructions      json.RawMessage `json:"instructions"`
+	Input             json.RawMessage `json:"input"`
+	Stream            bool            `json:"stream"`
+	MaxOutputTokens   *int64          `json:"max_output_tokens"`
+	Reasoning         json.RawMessage `json:"reasoning"`
+	Tools             json.RawMessage `json:"tools"`
+	ToolChoice        json.RawMessage `json:"tool_choice"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+	Store             *bool           `json:"store"`
+	Metadata          json.RawMessage `json:"metadata"`
+	LLMServer         struct {
 		IdempotencyKey string `json:"idempotency_key"`
 		Budget         *struct {
 			MaxCharge string `json:"max_charge"`
@@ -86,6 +88,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"object":   "model",
 			"created":  0,
 			"owned_by": "llmserver",
+			"llmserver_capabilities": map[string]any{
+				"function_calling":    model.FunctionCalling,
+				"parallel_tool_calls": false,
+			},
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -131,8 +137,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_idempotency_key", "idempotency_key must be at most 256 characters", "llmserver.idempotency_key")
 		return
 	}
-	if hasNonEmptyJSONValue(request.Tools) {
-		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "unsupported_feature", "function tools are not implemented in this Stage 1 slice", "tools")
+	toolRequest, err := toolcall.Parse(request.Tools, request.ToolChoice, request.ParallelToolCalls)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tools", err.Error(), "tools")
 		return
 	}
 	instructions, err := canonicalJSONText(request.Instructions)
@@ -146,6 +153,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canonicalInput := strings.TrimSpace(strings.Join([]string{instructions, inputText}, "\n"))
+	if toolRequest.Enabled() {
+		canonicalInput = canonicalToolBillingInput(request.Instructions, request.Input, toolRequest.Tools, toolRequest.ToolChoice)
+	}
 	reasoningEffort, err := parseReasoningEffort(request.Reasoning)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_reasoning", err.Error(), "reasoning.effort")
@@ -161,6 +171,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		ReasoningEffort: reasoningEffort,
 		RawRequest:      body,
 		IdempotencyKey:  request.LLMServer.IdempotencyKey,
+		ToolCall:        toolRequest,
 	}
 	if request.LLMServer.Budget != nil {
 		gatewayRequest.Budget = &gateway.BudgetRequest{
@@ -187,6 +198,22 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeResponse(w, events, strict)
+}
+
+func canonicalToolBillingInput(instructions, input, tools, choice json.RawMessage) string {
+	value := map[string]json.RawMessage{
+		"input":       input,
+		"tools":       tools,
+		"tool_choice": choice,
+	}
+	if len(bytes.TrimSpace(instructions)) > 0 && !bytes.Equal(bytes.TrimSpace(instructions), []byte("null")) {
+		value["instructions"] = instructions
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return string(input)
+	}
+	return string(encoded)
 }
 
 func parseReasoningEffort(raw json.RawMessage) (string, error) {
@@ -334,20 +361,6 @@ func canonicalJSONText(raw json.RawMessage) (string, error) {
 		return "", err
 	}
 	return string(canonical), nil
-}
-
-func hasNonEmptyJSONValue(raw json.RawMessage) bool {
-	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return false
-	}
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
-		return true
-	}
-	if values, ok := value.([]any); ok {
-		return len(values) > 0
-	}
-	return true
 }
 
 func writeSSE(w io.Writer, eventType string, payload any) {

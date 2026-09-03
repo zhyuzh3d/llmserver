@@ -10,6 +10,7 @@ llmserver 是运行在 macOS 本机的统一 LLM API 网关。它把标准 OpenA
 
 - `GET /healthz`、`GET /readyz`、`GET /v1/models`；
 - `POST /v1/responses` 非流式响应和 SSE 流式响应；
+- OpenAI Responses 自定义函数调用闭环：`tools`、`tool_choice`、单函数 `function_call` 和下一轮 `function_call_output`；
 - 每个访问密钥独立的模型白名单和每日平台价美元额度；
 - 标准 Responses API、Codex CLI、WorkBuddy CLI 三类 Provider；
 - 管理台刷新可用模型、启停模型、设置公开 ID 和输入/输出价格；
@@ -20,7 +21,7 @@ llmserver 是运行在 macOS 本机的统一 LLM API 网关。它把标准 OpenA
 - 仅本机可访问的管理台和配置热更新；
 - macOS 用户登录会话内常驻运行，进程异常退出后由 `launchd` 拉起。
 
-当前公开兼容面不是完整 OpenAI API：没有 `/v1/chat/completions`；工具调用不支持；`store=true` 不支持；不提供服务端会话续接；Codex 和 WorkBuddy 只执行无工具、无历史状态的文本请求。标准 API Provider 会透传大部分额外 Responses 字段，但不能据此认为所有 Provider 都具有相同能力。调用方应以 [GUIDE.md](./GUIDE.md) 明确列出的字段为稳定契约。
+当前公开兼容面不是完整 OpenAI API：没有 `/v1/chat/completions`；不支持 MCP、托管工具和并行工具链；函数参数增量流事件尚未作为稳定契约；`store=true` 与服务端会话续接不支持。标准 API Provider 会透传大部分额外 Responses 字段，但不能据此认为所有 Provider 都具有相同能力。调用方应以 [GUIDE.md](./GUIDE.md) 明确列出的字段为稳定契约。
 
 ## 快速启动
 
@@ -73,7 +74,7 @@ provider_api_keys:
 - `server`：API 地址、管理台地址和 SQLite 路径；
 - `clients`：访问密钥 ID、允许模型和可选的 `daily_limit_usd`；
 - `providers`：Provider 类型、连接方式、可执行程序和新发现模型的默认公开价格；
-- `deployments`：公开模型 ID、上游模型、公开价格、可选后台实际成本/积分费率及启用状态。
+- `deployments`：公开模型 ID、上游模型、函数调用能力、公开价格、可选后台实际成本/积分费率及启用状态。
 
 建议通过管理台修改供应商、模型和访问密钥。保存时会先验证完整配置，再原子写入上述两个 YAML，并让新请求立即使用新快照。只改访问密钥、Deployment、价格、供应商显示名称或模型发现 URL 时，会复用连接参数未变化的 Provider，不会丢掉 Codex HTTP 连接和 WorkBuddy ACP 热身；只有执行程序、上游生成 URL/鉴权、并发、默认推理强度或速度层级等运行参数变化时才替换对应 Provider。手工修改 YAML 后不会自动重载，需要重启服务；`server.listen`、`server.admin_listen` 和 `server.state_path` 即使通过管理接口写入，也必须重启后才真正改变监听或数据库。
 
@@ -91,11 +92,11 @@ provider_api_keys:
 
 ### Codex 与 WorkBuddy
 
-这两类是系统 Provider，只能配置现有项，不能从管理台新增。两者都只开放无工具、单轮、文本生成；Codex App Server 兜底和 WorkBuddy ACP session 使用隔离的临时目录。请求方看不到本机账号和真实上游模型身份。
+这两类是系统 Provider，只能配置现有项，不能从管理台新增。Codex 可在已验证的模型上通过登录态 Responses 直连执行调用方自定义函数协议；WorkBuddy 继续只开放无工具文本生成。Codex App Server 兜底和 WorkBuddy ACP session 使用隔离的临时目录，请求方看不到本机账号和真实上游模型身份。
 
-Codex 生成主链使用当前登录态的最小化 Responses SSE 请求，只发送文本输入且声明空工具集；HTTP 连接常驻复用，并遵循 macOS 当前 HTTPS 系统代理。若当前 Codex 内部接口因鉴权刷新或协议变动而明确不可用，才切换到隔离、常驻的官方 App Server worker；不对状态不明的网络错误自动重放，避免一次调用产生两次上游消耗。
+Codex 生成主链使用当前登录态的最小化 Responses SSE 请求，HTTP 连接常驻复用，并遵循 macOS 当前 HTTPS 系统代理。纯文本请求继续发送空工具集并保持原性能路径；函数请求只发送调用方本轮声明的函数，并收集 `response.output_item.done` 重建标准输出。函数链路要求直连 Responses 可用，不会降级到无法表达动态自定义函数的 App Server；普通文本请求在直连接口明确不可用时仍可切换到隔离、常驻的 App Server worker。状态不明的网络错误不自动重放，避免一次调用产生两次上游消耗。
 
-WorkBuddy 使用与 IDE/Web 集成一致的 ACP stdio 长连接。默认并行建立并常驻两个 worker，启动时每个槽位并行执行一次最短真实生成，预热 Node、登录认证、TLS 和模型路由；worker 因取消、超时或协议错误失效后，后台自动补齐并重新预热。进程跨请求复用，但每次调用新建独立 session 和临时 cwd，通过 `session/set_model` 与 `session/set_config_option` 显式设置模型和推理强度，并直接转发 `agent_message_chunk`。worker 使用 `--no-session-persistence`，同时关闭 Auto Memory、system reminder、会话摘要/标题、插件市场、热重载、cron、REPL 和遥测；不会加载用户/项目设置、MCP 或工具。积分直接取自同一次公开请求的 ACP usage 事件，不发起额外额度、余额或积分请求。模型列表中的积分倍率只是产品目录元数据，不等于本次实际积分，也不是账号剩余积分。
+WorkBuddy 使用与 IDE/Web 集成一致的 ACP stdio 长连接。默认在后台并行建立并常驻两个 worker，启动时每个槽位并行执行一次最短真实生成，预热 Node、登录认证、TLS 和模型路由；API 与管理监听不会等待桌面软件冷启动或登录恢复，WorkBuddy 请求本身会等待首个 worker 就绪。ACP 初始化有超时保护，worker 因取消、超时或协议错误失效后，后台自动补齐并重新预热。进程跨请求复用，但每次调用新建独立 session 和临时 cwd，通过 `session/set_model` 与 `session/set_config_option` 显式设置模型和推理强度，并直接转发 `agent_message_chunk`。worker 使用 `--no-session-persistence`，同时关闭 Auto Memory、system reminder、会话摘要/标题、插件市场、热重载、cron、REPL 和遥测；不会加载用户/项目设置、MCP 或工具。积分直接取自同一次公开请求的 ACP usage 事件，不发起额外额度、余额或积分请求。模型列表中的积分倍率只是产品目录元数据，不等于本次实际积分，也不是账号剩余积分。
 
 系统 Provider 可配置最大并发和默认推理强度。Codex 还可启用 `priority` 速度层级；它能降低等待时间，但会增加登录账号的额度消耗。默认值当前为 Codex `low + priority`、WorkBuddy `high`。当前产品目录中的 `hy4-preview` 标记为只支持 `high` 且不可关闭思考，因此公开 Deployment 也只接受 `high`；不再接受实际无效的 `minimal/low` 并制造错误预期。
 
@@ -123,14 +124,14 @@ WorkBuddy 使用与 IDE/Web 集成一致的 ACP stdio 长连接。默认并行�
 2. “供应商”：管理 API Provider，刷新三类 Provider 的模型并配置发布状态和价格；
 3. “平台消耗”：按供应商和时间窗查看平台价、供应商实际消耗及模型明细；
 4. “访问密钥”：生成/复制持久 Token，设置模型白名单和每日额度；
-5. “用户消耗”：按访问密钥和时间窗查看总量及模型明细。
+5. “用户消耗”：按访问密钥查看平台模拟价总量，以及不同模型随时间变化的消耗折线图。
 
 推荐的管理员初始化顺序：
 
 1. 先在“供应商”确认系统 Provider 状态，并按需添加标准 API Provider；
 2. 点击“刷新/设置模型”，选择对外发布的模型，设置公开模型 ID、平台输入价和平台输出价；
 3. 在“访问密钥”为每台设备分别建立一个持久 Token，并只勾选该设备需要的模型；
-4. 完成测试调用后，在“平台消耗”和“用户消耗”核对平台价、实际消耗及模型明细。
+4. 完成测试调用后，在“平台消耗”核对供应商实际消耗，在“用户消耗”核对访问密钥的平台价趋势。
 
 ### 供应商管理
 
@@ -151,9 +152,14 @@ WorkBuddy 系统供应商还可设置自动预热、预热模型和超时。预�
 - 对外公开模型 ID；
 - 平台输入价和平台输出价，单位为每百万 Token 的 USD；
 - API 模型可选的实际消耗记录方式及对应费率；
-- WorkBuddy 模型目录提供的积分倍率，只作为供应商产品信息展示。
+- WorkBuddy 模型目录提供的积分倍率，只作为供应商产品信息展示；
+- 函数调用能力：`native`、`emulated` 或 `unsupported`。
 
-模型发现结果中的 `supported_reasoning_efforts` 用于校验公开请求的 `reasoning.effort`；调用值不在模型允许列表时会在启动上游前拒绝。Codex 的 `model/list` 当前会漏报 GPT-5.6 Luna、Terra、Sol 已验证可用的 `none`，服务端会只对这三个精确模型 ID 补齐该能力。`hard_budget_supported` 用于硬预算准入判断。两者当前都没有管理台编辑入口，需要修改时应直接编辑 `configs/config.yaml` 并重启服务。
+模型发现结果中的 `supported_reasoning_efforts` 用于校验公开请求的 `reasoning.effort`；调用值不在模型允许列表时会在启动上游前拒绝。Codex 的 `model/list` 当前会漏报 GPT-5.6 Luna、Terra、Sol 已验证可用的 `none`，服务端会只对这三个精确模型 ID 补齐该能力。`hard_budget_supported` 用于硬预算准入判断。这两项当前没有管理台编辑入口，需要修改时应直接编辑 `configs/config.yaml` 并重启服务。
+
+`function_calling` 是 Deployment 的明确能力门：省略等价于 `unsupported`；只有 `native` 会接受非空 `tools`；`emulated` 只诚实标记上游可能用提示词生成 JSON，不会被公开接口当作可执行的原生身体能力。管理台模型弹窗可以修改该项，但管理员只应在完成强制函数选择、Schema 参数、工具结果续接和无副作用测试后启用 `native`。WorkBuddy 当前固定为 `unsupported`。
+
+公开函数契约以 [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create) 为基线，不另造私有工具协议。llmserver 只传递并校验函数意图，不执行调用方函数，也不会把 Codex 自身的文件、Shell、MCP 或其他本机工具暴露给调用方。
 
 手工保存的模型价格优先于刷新模型时发现的默认价格。取消启用并保存后，新请求立即不能再使用该模型；已经开始的请求继续使用启动时的配置快照。平台公开价格与供应商实际消耗始终分离：前者用于调用方账单，后者只用于管理统计。
 
@@ -169,7 +175,7 @@ Codex 不采集也不展示账户额度。WorkBuddy 的实际消耗固定优先�
 
 ### 消耗统计
 
-“平台消耗”按供应商汇总，“用户消耗”按访问密钥汇总；两者都支持按最近若干小时或天筛选，并列出有消耗的模型。统计中严格区分：
+“平台消耗”按供应商和自定义时间窗汇总平台价、实际消耗及模型明细。“用户消耗”只展示平台模拟价，提供最近 1 小时每 5 分钟、最近 3 小时和 6 小时每 10 分钟、最近 1 天每 30 分钟以及最近 3 天每小时的折线图；每个非零模型使用独立颜色，并显示该时间段的总额。统计中严格区分：
 
 - 平台价消耗：按公开模型价格和计费 Token 计算，单位 USD；
 - API 供应商实际消耗：优先使用供应商实报，否则使用模型配置的实际费率估算；
@@ -180,7 +186,11 @@ WorkBuddy 当前没有可靠的剩余积分查询接口，因此管理台展示�
 
 ## 性能链路与诊断
 
-网关不会跨 Provider 重试，也不会为了统计额外请求 Codex/WorkBuddy。Codex 只有在上游明确返回可安全回退的 HTTP 状态且尚未开始生成时，才使用 App Server 兜底；连接中断等结果不明的错误不会重放。每次完成请求只执行一次本地结算事务。服务日志会为每个 Run 输出 `provider_start_ms`、`first_delta_ms` 和 `total_ms`，不记录提示词、回答或凭据。`provider_start_ms` 表示 Adapter 建立本次事件流所需时间，不同传输下可能包含排队、HTTP 响应头或 session 初始化；判断用户体验应以 `first_delta_ms` 和 `total_ms` 为主。
+网关不会跨 Provider 重试，也不会为了统计额外请求 Codex/WorkBuddy。纯文本请求不注入任何函数 Schema；函数请求在 API 入口只做一次本地结构与 Schema 编译校验，并且只把调用方实际提交的工具传给上游。调用方应按任务筛选少量工具，因为 Schema 本身计入输入上下文；函数执行后生成最终回答还需要第二次模型调用。Codex 普通请求只有在上游明确返回可安全回退的 HTTP 状态且尚未开始生成时才使用 App Server 兜底，函数请求不做不兼容降级；连接中断等结果不明的错误不会重放。
+
+每次完成请求只执行一次本地结算事务。函数参数属于本轮输出 Token，`function_call_output` 属于下一轮输入 Token；调用方本地函数本身不由 llmserver 计价。服务日志会为每个 Run 输出 `provider_start_ms`、`first_delta_ms` 和 `total_ms`，不记录提示词、回答或凭据。`provider_start_ms` 表示 Adapter 建立本次事件流所需时间，不同传输下可能包含排队、HTTP 响应头或 session 初始化；判断用户体验应以 `first_delta_ms` 和 `total_ms` 为主。
+
+2026-09-02 的本机真实函数调用验收中，Codex Luna、Terra、Sol 均通过登录态直连返回声明函数和符合 Schema 的参数，单次工具决策约 `1–3` 秒；Luna 的 `function_call_output` 第二轮成功生成最终文本。标准 API Luna、Sol 通过统一接口完成函数调用，Terra 对同一供应商的直连协议测试成功但统一接口测试遇到过上游瞬时启动失败，因此能力成立不等于供应商稳定性保证。
 
 2026-08-31 的本机短回答受控实测中，Codex 最小化直连首段约 `1.45–2.40` 秒、总耗时约 `1.64–2.68` 秒；最终部署 smoke 为 `2.25/2.40` 秒。同一任务在旧 App Server 重链中通常为 `5–20+` 秒。WorkBuddy 旧链路曾出现约 `3,100` 个固定输入 Token 和数十秒等待。2026-09-01 升级到 CLI `2.132.x` 并启用无状态轻量链路后，10 次公开 API 短回答输入稳定为 `121` Token，SSE 创建耗时 `1.9–8` 毫秒，首个可见文本中位数 `4.02` 秒、P90 `4.93` 秒，总耗时中位数 `4.68` 秒、P90 `5.52` 秒；唯一一次冷态/上游波动为 `8.50/8.78` 秒。配置热更新会保留 ACP worker，不因普通管理操作反复冷启动。
 
@@ -193,9 +203,10 @@ scripts/llmserver-service start
 scripts/llmserver-service restart
 scripts/llmserver-service status
 scripts/llmserver-service stop
+scripts/llmserver-service uninstall
 ```
 
-`start`/`restart` 会重新构建 `dist/llmserver`，再通过 `launchctl submit` 注册 `cc.hominal.llmserver`。服务脱离终端运行且异常退出后自动拉起；由于没有安装持久 plist，macOS 重启或用户重新登录后需要再次执行 `start`。
+`start`/`restart` 会重新构建 `dist/llmserver`，安装用户级 `~/Library/LaunchAgents/cc.hominal.llmserver.plist`，再通过 `launchctl bootstrap` 启动。服务脱离终端运行、异常退出后自动拉起，并在 macOS 重启后的用户登录阶段自动启动。`stop` 只停止当前登录会话，保留下一次登录自动启动；`uninstall` 停止服务并把 plist 改名为 `.disabled`，用于明确取消自动启动且保留可恢复副本。
 
 ### Codex / WorkBuddy 升级检查
 

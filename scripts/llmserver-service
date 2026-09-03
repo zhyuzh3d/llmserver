@@ -4,15 +4,17 @@ setopt pipefail
 
 repo_root=${0:A:h:h}
 service_label=cc.hominal.llmserver
-service_domain="gui/$(id -u)/${service_label}"
+user_domain="gui/$(id -u)"
+service_domain="${user_domain}/${service_label}"
 binary_path="${repo_root}/dist/llmserver"
 public_config="${repo_root}/configs/config.yaml"
 secret_config="${repo_root:h}/xconfigs/llmserver/xconfig.yaml"
+launch_agent_path="${HOME}/Library/LaunchAgents/${service_label}.plist"
 account_name=$(id -un)
 account_home=${HOME}
 node_binary=$(command -v node 2>/dev/null || true)
 
-start_service() {
+build_binary() {
   if [[ -z "${node_binary}" ]]; then
     print -u2 "node is required by the WorkBuddy adapter"
     exit 1
@@ -20,30 +22,83 @@ start_service() {
   mkdir -p "${repo_root}/dist" "${repo_root}/var"
   (cd "${repo_root}" && go build -o "${repo_root}/dist/llmserver.next" ./cmd/llmserver)
   mv "${repo_root}/dist/llmserver.next" "${binary_path}"
-  launchctl remove "${service_label}" 2>/dev/null || true
+}
+
+write_launch_agent() {
+  mkdir -p "${launch_agent_path:h}" "${repo_root}/var"
+  local temporary_plist
+  temporary_plist=$(mktemp "${launch_agent_path}.XXXXXX")
+  trap 'rm -f "${temporary_plist}"' EXIT
+  /usr/bin/plutil -create xml1 "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :Label string ${service_label}" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :ProgramArguments array" "${temporary_plist}"
+  local arguments=(
+    /usr/bin/env -i
+    "HOME=${account_home}" "USER=${account_name}" "LOGNAME=${account_name}"
+    SHELL=/bin/zsh TMPDIR=/tmp LANG=zh_CN.UTF-8
+    "PATH=${node_binary:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    "${binary_path}" -config "${public_config}" -xconfig "${secret_config}"
+  )
+  local index=0
+  local argument
+  for argument in "${arguments[@]}"; do
+    /usr/libexec/PlistBuddy -c "Add :ProgramArguments:${index} string ${argument}" "${temporary_plist}"
+    (( index += 1 ))
+  done
+  /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string ${repo_root}" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :RunAtLoad bool true" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :KeepAlive bool true" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 10" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :StandardOutPath string ${repo_root}/var/llmserver.stdout.log" "${temporary_plist}"
+  /usr/libexec/PlistBuddy -c "Add :StandardErrorPath string ${repo_root}/var/llmserver.stderr.log" "${temporary_plist}"
+  /usr/bin/plutil -lint "${temporary_plist}" >/dev/null
+  /usr/bin/install -m 0644 "${temporary_plist}" "${launch_agent_path}"
+  rm -f "${temporary_plist}"
+  trap - EXIT
+}
+
+unload_service() {
+  launchctl bootout "${service_domain}" >/dev/null 2>&1 || launchctl remove "${service_label}" 2>/dev/null || true
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
     launchctl print "${service_domain}" >/dev/null 2>&1 || break
     sleep 0.2
   done
-  launchctl submit -l "${service_label}" \
-    -o "${repo_root}/var/llmserver.stdout.log" \
-    -e "${repo_root}/var/llmserver.stderr.log" -- \
-    /usr/bin/env -i \
-    "HOME=${account_home}" "USER=${account_name}" "LOGNAME=${account_name}" \
-    SHELL=/bin/zsh TMPDIR=/tmp LANG=zh_CN.UTF-8 \
-    "PATH=${node_binary:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    "${binary_path}" -config "${public_config}" -xconfig "${secret_config}"
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+}
+
+start_service() {
+  build_binary
+  write_launch_agent
+  unload_service
+  launchctl enable "${service_domain}"
+  launchctl bootstrap "${user_domain}" "${launch_agent_path}"
+  for attempt in {1..30}; do
     if curl -fsS http://127.0.0.1:4815/readyz >/dev/null 2>&1; then
       print "llmserver is ready"
       print "API:   http://127.0.0.1:4815/v1"
       print "Admin: http://127.0.0.1:4816/admin/"
+      print "Auto start: ${launch_agent_path}"
       return
     fi
     sleep 1
   done
   print -u2 "llmserver did not become ready; inspect ${repo_root}/var/llmserver.stderr.log"
   exit 1
+}
+
+stop_service() {
+  unload_service
+  print "llmserver stopped; it remains enabled for the next macOS login"
+}
+
+uninstall_service() {
+  unload_service
+  if [[ -f "${launch_agent_path}" ]]; then
+    mv "${launch_agent_path}" "${launch_agent_path}.disabled"
+    print "auto start removed; previous plist kept at ${launch_agent_path}.disabled"
+  else
+    print "auto start is not installed"
+  fi
 }
 
 status_service() {
@@ -57,7 +112,8 @@ status_service() {
 
 case "${1:-start}" in
   start|restart) start_service ;;
-  stop) launchctl remove "${service_label}" ;;
+  stop) stop_service ;;
+  uninstall) uninstall_service ;;
   status) status_service ;;
-  *) print -u2 "usage: $0 {start|restart|stop|status}"; exit 2 ;;
+  *) print -u2 "usage: $0 {start|restart|stop|status|uninstall}"; exit 2 ;;
 esac

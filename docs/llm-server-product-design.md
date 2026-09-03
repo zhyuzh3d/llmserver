@@ -301,7 +301,7 @@ type ProviderAdapter interface {
 
 ## 9. 函数、会话与 agent 边界
 
-标准 API 的原生 function calls 保留原生语义。Codex/WorkBuddy 若不能原生提供 caller-defined function call，只能在 Deployment 标记 `emulated` 后，用严格输出 schema 模拟；参数必须再次通过原 JSON Schema 校验，且模拟产生的额外用量计入同一结算。
+统一接口保留 OpenAI Responses 原生 function call 语义，并由每个 Deployment 显式声明 `native`、`emulated` 或 `unsupported`。只有经过协议验证的 `native` Deployment 才接受非空 `tools`；`emulated` 只是后台能力事实，不能冒充为可执行的原生函数接口。Gateway 在返回前必须校验函数已声明、`call_id`、参数 JSON 与原始 Schema，并拒绝并行或多函数结果。当前 Codex 已验证可在最小化 Responses 直连上原生转发调用方函数；WorkBuddy 没有可靠的 caller-defined function 协议，保持 `unsupported`。
 
 Provider 自己的本地工具和调用方定义的函数是两个命名空间。默认 `model-only` 执行配置不得批准或代理文件、shell、PTY、浏览器、GUI、Keychain、MCP 或插件副作用。仅靠 system prompt、空白工作目录或“未观察到调用”都不构成安全隔离证据。
 

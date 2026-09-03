@@ -3,7 +3,7 @@
 > 前置文档：[llmServer 后端产品与技术总纲](./llm-server-product-design.md)、[Stage 1：标准 API 与结算内核](./stage-1-standard-api.md)
 > 范围：把本机 Codex 作为一个受限、可计价、可观测的 Provider 接入
 > 明确排除：远程控制 Codex、向调用方/Git 导出登录凭据、Web 控制台、Hominal 接入
-> 实现状态：已实现并真实验证最小化 Responses SSE 性能主链、隔离常驻 App Server 兼容兜底、公开计价、usage、取消、推理强度和优先速度层级；不采集 Codex 账户额度
+> 实现状态：已实现并真实验证最小化 Responses SSE 性能主链、原生自定义函数调用、隔离常驻 App Server 文本兼容兜底、公开计价、usage、取消、推理强度和优先速度层级；不采集 Codex 账户额度
 
 ## 1. Stage 目标
 
@@ -15,7 +15,7 @@ Codex Adapter 必须完全复用 Stage 1 的 Deployment、Run、GatewayEvent、P
 
 当前实现保留两条语义等价但优先级明确的传输：
 
-- 性能主链：按 Codex 开源客户端当前请求结构，使用当前登录态向 ChatGPT Codex Responses 端点发送最小化 SSE 请求。请求只有文本输入、空工具集、`store=false`、推理强度和可选速度层级；HTTP client 与连接跨请求复用，并读取 macOS 当前 HTTPS 系统代理。
+- 性能主链：按 Codex 开源客户端当前请求结构，使用当前登录态向 ChatGPT Codex Responses 端点发送最小化 SSE 请求。普通生成发送空工具集；函数请求只发送调用方本轮声明的自定义函数、`tool_choice` 和 `parallel_tool_calls=false`。两类请求均保持 `store=false`、推理强度和可选速度层级；HTTP client 与连接跨请求复用，并读取 macOS 当前 HTTPS 系统代理。
 - 兼容兜底：隔离、常驻的 `codex app-server --stdio` worker。每次请求仍新建 ephemeral thread 和临时 cwd，审批为 never、sandbox 为 read-only，并禁用 apps、plugins、hooks、browser/computer use、image generation 和 skill search。
 
 当前生成链为：
@@ -140,9 +140,9 @@ Codex 可能在一个 turn 内产生不可见的内部步骤，且 token usage u
 
 ## 8. 输出边界
 
-文本 delta 映射为统一 `output_text.delta`。Responses 或 Codex item 中的答案文本、错误和终态分别映射；原始 chain-of-thought 不输出、不入普通日志。主链只承诺文本输入和文本输出。
+文本 delta 映射为统一 `output_text.delta`。Responses 或 Codex item 中的答案文本、错误和终态分别映射；原始 chain-of-thought 不输出、不入普通日志。原生自定义函数仅在 Deployment 明确标记 `function_calling: native` 时开放；Gateway 在上游返回后、对外暴露前验证函数已声明、`call_id`、JSON 参数及原始 Schema，并拒绝多函数结果。当前稳定流式契约只保证最终 `response.completed.response.output` 中的完整 `function_call`，不保证参数 delta。
 
-当前不支持 caller-defined function tools 或结构化输出；公开请求携带 tools、tool choice 或 JSON Schema 时在进入 Provider 前拒绝。Codex 自己的 shell、文件、MCP、web 或 GUI 工具事件也绝不能转换为调用方函数，兜底路径观察到相关 item 时直接失败。
+函数请求必须走能表达动态工具定义的 Responses 直连，不降级到 App Server；这样不会把提示词模拟 JSON 冒充为原生函数，也避免无法等价重放时产生第二笔消耗。Codex 自己的文件、shell、MCP、web 或 GUI 工具与调用方函数是完全不同的命名空间，前者绝不能被公开或执行；兜底路径观察到这些本机工具 item 时仍直接失败。
 
 ## 9. model-only 安全配置
 

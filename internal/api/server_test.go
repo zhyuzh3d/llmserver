@@ -69,6 +69,94 @@ func TestModelsAreFilteredByClientPolicy(t *testing.T) {
 	if strings.Contains(response.Body.String(), "sol") || !strings.Contains(response.Body.String(), "terra") {
 		t.Fatalf("unexpected model list: %s", response.Body.String())
 	}
+	if !strings.Contains(response.Body.String(), `"function_calling":"native"`) || !strings.Contains(response.Body.String(), `"parallel_tool_calls":false`) {
+		t.Fatalf("model capability is missing: %s", response.Body.String())
+	}
+}
+
+func TestNativeFunctionCallRoundTripContract(t *testing.T) {
+	adapter := &functionAdapter{response: map[string]any{
+		"model": "upstream",
+		"output": []any{map[string]any{
+			"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "search_memory", "arguments": `{"query":"Alice"}`, "status": "completed",
+		}},
+	}}
+	server := newTestServer(t, adapter)
+	body := `{
+  "model":"terra",
+  "input":"What does Alice remember?",
+  "tools":[{"type":"function","name":"search_memory","description":"Search memory","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false},"strict":true}],
+  "tool_choice":"required",
+  "parallel_tool_calls":false
+}`
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, newRequest(t, http.MethodPost, "/v1/responses", body))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"function_call"`) || !strings.Contains(response.Body.String(), `"call_id":"call_1"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(string(adapter.lastRequest.Input), "What does Alice remember?") || adapter.lastRequest.ToolCall == nil || !adapter.lastRequest.ToolCall.Enabled() {
+		t.Fatalf("provider request lost structured function contract: %#v", adapter.lastRequest)
+	}
+
+	adapter.response = map[string]any{
+		"model":  "upstream",
+		"output": []any{map[string]any{"type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "Alice remembers the garden."}}}},
+	}
+	continuation := `{
+  "model":"terra",
+  "input":[
+    {"type":"function_call","call_id":"call_1","name":"search_memory","arguments":"{\"query\":\"Alice\"}"},
+    {"type":"function_call_output","call_id":"call_1","output":"Alice remembers the garden."}
+  ],
+  "tools":[{"type":"function","name":"search_memory","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false},"strict":true}],
+  "tool_choice":"auto",
+  "parallel_tool_calls":false
+}`
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, newRequest(t, http.MethodPost, "/v1/responses", continuation))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Alice remembers the garden") {
+		t.Fatalf("continuation status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(string(adapter.lastRequest.Input), "function_call_output") {
+		t.Fatalf("function_call_output was not preserved: %s", adapter.lastRequest.Input)
+	}
+}
+
+func TestFunctionToolsFailClosedBeforeUnsupportedProviderStarts(t *testing.T) {
+	adapter := &countingAdapter{Adapter: mock.Adapter{ProviderID: "mock", ResponseText: "ok"}}
+	service, err := gateway.NewService([]config.DeploymentConfig{{
+		ID: "plain", ProviderID: "mock", UpstreamModel: "plain", Enabled: true, FunctionCalling: "unsupported",
+		Price: config.PriceConfig{Revision: "price", Currency: "USD", InputPerMillion: "1", OutputPerMillion: "1"},
+	}}, []provider.Adapter{adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(auth.New(auth.NewClient("device", "client-secret", []string{"plain"})), service)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, newRequest(t, http.MethodPost, "/v1/responses", `{
+  "model":"plain","input":"hello",
+  "tools":[{"type":"function","name":"ping","parameters":{"type":"object","additionalProperties":false}}]
+}`))
+	if response.Code != http.StatusUnprocessableEntity || adapter.starts != 0 || !strings.Contains(response.Body.String(), "function_call_not_supported") {
+		t.Fatalf("status=%d starts=%d body=%s", response.Code, adapter.starts, response.Body.String())
+	}
+}
+
+func TestInvalidFunctionArgumentsAreNotExposedOrSettled(t *testing.T) {
+	adapter := &functionAdapter{response: map[string]any{
+		"model":  "upstream",
+		"output": []any{map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{"id":"not-an-integer"}`}},
+	}}
+	server := newTestServer(t, adapter)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, newRequest(t, http.MethodPost, "/v1/responses", `{
+  "model":"terra","input":"lookup",
+  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}],
+  "tool_choice":"required"
+}`))
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "invalid_provider_tool_call") || strings.Contains(response.Body.String(), "not-an-integer") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestResponsesStreamingIncludesFinalBillingEvent(t *testing.T) {
@@ -81,6 +169,26 @@ func TestResponsesStreamingIncludesFinalBillingEvent(t *testing.T) {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("stream is missing %q: %s", expected, body)
 		}
+	}
+}
+
+func TestStreamingFunctionCallIsAvailableInCompletedResponse(t *testing.T) {
+	adapter := &functionAdapter{response: map[string]any{
+		"model": "upstream",
+		"output": []any{map[string]any{
+			"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": `{"id":7}`,
+		}},
+	}}
+	server := newTestServer(t, adapter)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, newRequest(t, http.MethodPost, "/v1/responses", `{
+  "model":"terra","input":"lookup 7","stream":true,
+  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}],
+  "tool_choice":"required","parallel_tool_calls":false
+}`))
+	body := response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "response.completed") || !strings.Contains(body, `"type":"function_call"`) || !strings.Contains(body, `"call_id":"call_1"`) {
+		t.Fatalf("status=%d body=%s", response.Code, body)
 	}
 }
 
@@ -225,7 +333,8 @@ func newTestServer(t *testing.T, adapter provider.Adapter) *Server {
 				InputPerMillion:  "2",
 				OutputPerMillion: "12",
 			},
-			Enabled: true,
+			Enabled:         true,
+			FunctionCalling: "native",
 		},
 		{
 			ID:            "sol",
@@ -268,6 +377,27 @@ type countingAdapter struct {
 	mock.Adapter
 	starts      int
 	lastRequest provider.Request
+}
+
+type functionAdapter struct {
+	response    map[string]any
+	lastRequest provider.Request
+}
+
+func (a *functionAdapter) ID() string { return "mock" }
+
+func (a *functionAdapter) Start(ctx context.Context, request provider.Request) (<-chan provider.Event, error) {
+	a.lastRequest = request
+	events := make(chan provider.Event, 1)
+	response := a.response
+	go func() {
+		defer close(events)
+		select {
+		case <-ctx.Done():
+		case events <- provider.Event{Type: provider.EventCompleted, Final: &provider.Final{Response: response, EffectiveModel: request.UpstreamModel}}:
+		}
+	}()
+	return events, nil
 }
 
 func (a *countingAdapter) Start(ctx context.Context, request provider.Request) (<-chan provider.Event, error) {

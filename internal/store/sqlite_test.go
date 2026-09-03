@@ -116,10 +116,29 @@ func TestUsageSummarySeparatesPublicChargeAndActualEstimate(t *testing.T) {
 	}
 	clientReport, err := repository.UsageReport(context.Background(), UsageReportFilter{
 		Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute), GroupBy: "client", ClientID: "device",
-		ProviderByDeployment: map[string]string{"model": "api"},
+		BucketDuration: 30 * time.Minute, PublicOnly: true, ProviderByDeployment: map[string]string{"model": "api"},
 	})
 	if err != nil || len(clientReport.Groups) != 1 || clientReport.Groups[0].ID != "device" {
 		t.Fatalf("client report = %#v err=%v", clientReport.Groups, err)
+	}
+	if clientReport.BucketMinutes != 30 || len(clientReport.PublicSeries) != 1 {
+		t.Fatalf("client time series = %#v", clientReport.PublicSeries)
+	}
+	if len(clientReport.Groups[0].ActualTotals) != 0 {
+		t.Fatalf("public-only report included actual costs: %#v", clientReport.Groups[0].ActualTotals)
+	}
+	series := clientReport.PublicSeries[0]
+	if series.DeploymentID != "model" || series.Unit != "USD" || series.Total != "0.000080000" || len(series.Points) != 3 {
+		t.Fatalf("client time series row = %#v", series)
+	}
+	var pointTotal string
+	for _, point := range series.Points {
+		if point.Total != "0.000000000" {
+			pointTotal = point.Total
+		}
+	}
+	if pointTotal != "0.000080000" {
+		t.Fatalf("non-zero time-series point = %q", pointTotal)
 	}
 }
 

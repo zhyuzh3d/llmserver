@@ -98,7 +98,8 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	if !a.config.DisableDirect && time.Now().UnixNano() >= a.directBlockedUntil.Load() {
+	toolRequest := request.ToolCall != nil && request.ToolCall.Enabled()
+	if !a.config.DisableDirect && (toolRequest || time.Now().UnixNano() >= a.directBlockedUntil.Load()) {
 		response, fallback, directErr := a.startDirect(ctx, request)
 		if directErr == nil {
 			events := make(chan provider.Event)
@@ -106,16 +107,20 @@ func (a *Adapter) Start(ctx context.Context, request provider.Request) (<-chan p
 				defer close(events)
 				defer func() { <-a.slot }()
 				defer response.Body.Close()
-				consumeDirectStream(ctx, response.Body, request.UpstreamModel, events)
+				consumeDirectStream(ctx, response.Body, request.UpstreamModel, toolRequest, events)
 			}()
 			return events, nil
 		}
-		if !fallback {
+		if !fallback || toolRequest {
 			slog.Warn("Codex direct Responses request failed", "provider", a.config.ProviderID, "error", directErr)
 			<-a.slot
 			return nil, directErr
 		}
 		slog.Info("Codex direct Responses route unavailable; using App Server fallback", "provider", a.config.ProviderID, "error", directErr)
+	}
+	if toolRequest {
+		<-a.slot
+		return nil, errors.New("Codex native function calling requires the direct Responses route")
 	}
 
 	worker, err := a.acquireWorker()
@@ -208,6 +213,22 @@ func (a *Adapter) startDirect(ctx context.Context, request provider.Request) (*h
 		"include":             []string{},
 		"prompt_cache_key":    "llmserver-codex-text-only-v2",
 	}
+	if request.ToolCall != nil && request.ToolCall.Enabled() {
+		input, inputErr := directToolInput(request.Input)
+		if inputErr != nil {
+			return nil, false, inputErr
+		}
+		instructions := modelOnlyFunctionInstructions
+		if strings.TrimSpace(request.Instructions) != "" {
+			instructions += "\n\n" + request.Instructions
+		}
+		body["instructions"] = instructions
+		body["input"] = input
+		body["tools"] = request.ToolCall.Tools
+		body["tool_choice"] = request.ToolCall.ToolChoice
+		body["include"] = []string{"reasoning.encrypted_content"}
+		body["prompt_cache_key"] = "llmserver-codex-function-v1"
+	}
 	if effort != "" {
 		body["reasoning"] = map[string]string{"effort": effort}
 	}
@@ -244,10 +265,29 @@ func (a *Adapter) startDirect(ctx context.Context, request provider.Request) (*h
 		// Authentication refresh and backend contract drift are delegated to
 		// the official App Server fallback. Suppress repeated failed probes for
 		// a short interval while preserving automatic recovery.
-		a.directBlockedUntil.Store(time.Now().Add(time.Minute).UnixNano())
+		if request.ToolCall == nil || !request.ToolCall.Enabled() {
+			a.directBlockedUntil.Store(time.Now().Add(time.Minute).UnixNano())
+		}
 		return nil, true, fmt.Errorf("Codex Responses returned HTTP %d", response.StatusCode)
 	default:
 		return nil, false, fmt.Errorf("Codex Responses returned HTTP %d", response.StatusCode)
+	}
+}
+
+func directToolInput(raw json.RawMessage) (any, error) {
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, errors.New("Codex function input is not valid JSON")
+	}
+	switch input := value.(type) {
+	case string:
+		return []map[string]any{{"role": "user", "content": []map[string]string{{"type": "input_text", "text": input}}}}, nil
+	case []any:
+		return input, nil
+	default:
+		return nil, errors.New("Codex function input must be a string or an array of Responses input items")
 	}
 }
 
@@ -330,10 +370,11 @@ func macOSSystemHTTPSProxy() *url.URL {
 	return proxyURL
 }
 
-func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel string, events chan<- provider.Event) {
+func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel string, preserveResponse bool, events chan<- provider.Event) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
 	var dataLines []string
+	var outputItems []any
 	completed := false
 	flush := func() bool {
 		if len(dataLines) == 0 {
@@ -356,6 +397,18 @@ func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel str
 		case "response.output_text.delta":
 			delta, _ := event["delta"].(string)
 			return delta == "" || send(ctx, events, provider.Event{Type: provider.EventOutputTextDelta, Delta: delta})
+		case "response.output_item.done":
+			item, exists := event["item"]
+			index, validIndex := directInteger(event["output_index"])
+			if !exists || !validIndex || index > 1024 {
+				send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex returned an invalid completed output item")})
+				return false
+			}
+			for int64(len(outputItems)) <= index {
+				outputItems = append(outputItems, nil)
+			}
+			outputItems[index] = item
+			return true
 		case "response.completed":
 			response, ok := event["response"].(map[string]any)
 			if !ok {
@@ -366,15 +419,28 @@ func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel str
 			if model == "" {
 				model = requestedModel
 			}
+			if output, _ := response["output"].([]any); len(output) == 0 && len(outputItems) > 0 {
+				compacted := make([]any, 0, len(outputItems))
+				for _, item := range outputItems {
+					if item != nil {
+						compacted = append(compacted, item)
+					}
+				}
+				response["output"] = compacted
+			}
 			usage, _ := response["usage"].(map[string]any)
 			inputTokens, inputPresent := directInteger(usage["input_tokens"])
 			outputTokens, outputPresent := directInteger(usage["output_tokens"])
 			final := &provider.Final{
+				OutputText:     directOutputText(response),
 				EffectiveModel: model,
 				Usage: pricing.ReportedUsage{
 					InputTokens:  pricing.OptionalCount{Value: inputTokens, Present: inputPresent},
 					OutputTokens: pricing.OptionalCount{Value: outputTokens, Present: outputPresent},
 				},
+			}
+			if preserveResponse {
+				final.Response = response
 			}
 			completed = true
 			return send(ctx, events, provider.Event{Type: provider.EventCompleted, Final: final})
@@ -409,6 +475,23 @@ func consumeDirectStream(ctx context.Context, body io.Reader, requestedModel str
 	if !completed {
 		send(ctx, events, provider.Event{Type: provider.EventFailed, Err: errors.New("Codex Responses stream ended before completion")})
 	}
+}
+
+func directOutputText(response map[string]any) string {
+	output, _ := response["output"].([]any)
+	var text strings.Builder
+	for _, value := range output {
+		item, _ := value.(map[string]any)
+		content, _ := item["content"].([]any)
+		for _, partValue := range content {
+			part, _ := partValue.(map[string]any)
+			if part["type"] == "output_text" {
+				partText, _ := part["text"].(string)
+				text.WriteString(partText)
+			}
+		}
+	}
+	return text.String()
 }
 
 func directInteger(value any) (int64, bool) {
@@ -555,6 +638,7 @@ func copyFile(source, target string, mode os.FileMode, required bool) error {
 }
 
 const modelOnlyInstructions = "You are serving one text-only model request. Never use shell, files, network, MCP, plugins, GUI, subagents, or any tool. Return only the answer requested by the user."
+const modelOnlyFunctionInstructions = "You are serving one model request. You may call only the custom functions explicitly supplied in this request. Never use shell, files, network, MCP, plugins, GUI, subagents, or any undeclared tool."
 
 func (w *appServerWorker) run(ctx context.Context, config Config, request provider.Request, events chan<- provider.Event) bool {
 	runDir, err := os.MkdirTemp(w.runtimeDir, "run-")

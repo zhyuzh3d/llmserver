@@ -70,6 +70,7 @@ type DeploymentConfig struct {
 	ProviderID               string          `yaml:"provider_id" json:"provider_id"`
 	UpstreamModel            string          `yaml:"upstream_model" json:"upstream_model"`
 	SupportedReasoningEffort []string        `yaml:"supported_reasoning_efforts,omitempty" json:"supported_reasoning_efforts,omitempty"`
+	FunctionCalling          string          `yaml:"function_calling,omitempty" json:"function_calling,omitempty"`
 	Price                    PriceConfig     `yaml:"price" json:"price"`
 	ActualPrice              *PriceConfig    `yaml:"actual_price,omitempty" json:"actual_price,omitempty"`
 	ActualPoints             *UnitRateConfig `yaml:"actual_points,omitempty" json:"actual_points,omitempty"`
@@ -340,6 +341,14 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("deployment %q references unknown provider %q", deployment.ID, deployment.ProviderID)
 		}
 		provider := providersByID[deployment.ProviderID]
+		switch deployment.FunctionCalling {
+		case "", "unsupported", "native", "emulated":
+		default:
+			return fmt.Errorf("deployment %q function_calling must be native, emulated, or unsupported", deployment.ID)
+		}
+		if deployment.FunctionCalling == "native" && provider.Type == "workbuddy_exec" {
+			return fmt.Errorf("deployment %q cannot enable native function calling on workbuddy_exec", deployment.ID)
+		}
 		if provider.DefaultReasoning != "" && len(deployment.SupportedReasoningEffort) > 0 && !containsString(deployment.SupportedReasoningEffort, provider.DefaultReasoning) {
 			return fmt.Errorf("provider %q default_reasoning_effort %q is not supported by deployment %q", provider.ID, provider.DefaultReasoning, deployment.ID)
 		}

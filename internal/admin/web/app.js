@@ -11,6 +11,7 @@ const state = {
   modelRows: [],
   modelProviderID: "",
   usageRange: { value: 1, unit: "days" },
+  userUsagePreset: "day",
   platformProvider: "",
   usageClient: "",
   accessDetails: {},
@@ -55,6 +56,13 @@ const compactDecimal = (value, digits) => fixedDecimal(value, digits).replace(/\
 const uiStateStorageKey = "llmserver.admin.ui-state.v1";
 const legacyAccessDetailsStorageKey = "llmserver.admin.access-details.v1";
 const validViews = new Set(["overview", "providers", "platform_usage", "access", "user_usage"]);
+const userUsagePresets = {
+  hour: { value: 1, unit: "hours", bucketMinutes: 5, label: "1 小时" },
+  three_hours: { value: 3, unit: "hours", bucketMinutes: 10, label: "3 小时" },
+  six_hours: { value: 6, unit: "hours", bucketMinutes: 10, label: "6 小时" },
+  day: { value: 1, unit: "days", bucketMinutes: 30, label: "1 天" },
+  three_days: { value: 3, unit: "days", bucketMinutes: 60, label: "3 天" },
+};
 
 function restoreUIState() {
   try {
@@ -67,6 +75,7 @@ function restoreUIState() {
     }
     if (typeof saved.platformProvider === "string") state.platformProvider = saved.platformProvider;
     if (typeof saved.usageClient === "string") state.usageClient = saved.usageClient;
+    if (Object.prototype.hasOwnProperty.call(userUsagePresets, saved.userUsagePreset)) state.userUsagePreset = saved.userUsagePreset;
     if (saved.accessDetails && typeof saved.accessDetails === "object" && !Array.isArray(saved.accessDetails)) {
       state.accessDetails = Object.fromEntries(Object.entries(saved.accessDetails).filter(([, open]) => typeof open === "boolean"));
     } else {
@@ -85,6 +94,7 @@ function persistUIState() {
     localStorage.setItem(uiStateStorageKey, JSON.stringify({
       activeView: state.activeView,
       usageRange: state.usageRange,
+      userUsagePreset: state.userUsagePreset,
       platformProvider: state.platformProvider,
       usageClient: state.usageClient,
       accessDetails: state.accessDetails,
@@ -410,7 +420,7 @@ function renderModelDialog(provider) {
   document.querySelector("#model-dialog-caption").textContent = "取消勾选会立即停用已有模型；未被本次目录发现的既有模型仍保留在列表末尾。";
   const defaults = provider.default_public_price || { currency: "USD", input_per_million: "0", output_per_million: "0" };
   const multiplierHeader = provider.type === "workbuddy_exec" ? "<th>积分倍率</th>" : "";
-  document.querySelector("#model-dialog-body").innerHTML = `<div class="model-table-wrap"><table class="model-table ${provider.type}"><thead><tr><th>启用</th><th>供应商模型</th>${multiplierHeader}<th>公开模型 ID</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th><th>实际口径</th><th>单位</th><th>实际输入 / 1M</th><th>实际输出 / 1M</th></tr></thead><tbody>${state.modelRows.map((row, index) => modelDialogRow(row, index, defaults, provider)).join("")}</tbody></table></div>`;
+  document.querySelector("#model-dialog-body").innerHTML = `<div class="model-table-wrap"><table class="model-table ${provider.type}"><thead><tr><th>启用</th><th>供应商模型</th>${multiplierHeader}<th>公开模型 ID</th><th>函数调用</th><th>平台输入 / 1M</th><th>平台输出 / 1M</th><th>实际口径</th><th>单位</th><th>实际输入 / 1M</th><th>实际输出 / 1M</th></tr></thead><tbody>${state.modelRows.map((row, index) => modelDialogRow(row, index, defaults, provider)).join("")}</tbody></table></div>`;
   document.querySelectorAll("[data-model-row]").forEach(element => {
     element.querySelector(".actual-kind")?.addEventListener("change", () => syncActualControls(element));
     syncActualControls(element);
@@ -420,6 +430,7 @@ function renderModelDialog(provider) {
 
 function modelDialogRow(row, index, defaults, provider) {
   const deployment = row.deployment;
+  const functionCalling = deployment?.function_calling || "unsupported";
   const actualKind = deployment?.actual_price ? "currency" : deployment?.actual_points ? "points" : "none";
   const actual = deployment?.actual_price || deployment?.actual_points || {};
   const multiplier = provider.type === "workbuddy_exec" ? `<td class="credit-multiplier">${row.model.credit_multiplier ? `× ${fixedDecimal(row.model.credit_multiplier, 2)}` : row.model.id === "auto" ? "动态" : "未公布"}</td>` : "";
@@ -437,6 +448,7 @@ function modelDialogRow(row, index, defaults, provider) {
     <td><strong>${escapeHTML(row.model.display_name || row.model.id)}</strong><small>${escapeHTML(row.model.id)}${row.discovered ? "" : " · 本次未发现"}</small></td>
     ${multiplier}
     <td><input class="compact public-id" value="${escapeHTML(deployment?.id || row.model.id)}"></td>
+    <td><select class="compact function-calling" ${provider.type === "workbuddy_exec" ? "disabled" : ""}><option value="unsupported" ${functionCalling === "unsupported" ? "selected" : ""}>不支持</option><option value="native" ${functionCalling === "native" ? "selected" : ""}>原生</option><option value="emulated" ${functionCalling === "emulated" ? "selected" : ""}>模拟标记</option></select></td>
     <td><input class="compact price-input public-input" value="${fixedDecimal(deployment?.price?.input_per_million || defaults.input_per_million, 2)}"></td>
     <td><input class="compact price-input public-output" value="${fixedDecimal(deployment?.price?.output_per_million || defaults.output_per_million, 2)}"></td>
     ${actualFields}
@@ -479,6 +491,7 @@ async function applyModels() {
     };
     deployment.id = id;
     deployment.enabled = enabled;
+    deployment.function_calling = provider.type === "workbuddy_exec" ? "unsupported" : element.querySelector(".function-calling").value;
     deployment.price = price;
     delete deployment.actual_price;
     delete deployment.actual_points;
@@ -679,7 +692,9 @@ async function renderUsage(groupBy) {
   bindUsageControls(groupBy);
   try {
     const filterName = isProvider ? "provider_id" : "client_id";
-    const query = new URLSearchParams({ group_by: groupBy, window_value: String(state.usageRange.value), window_unit: state.usageRange.unit });
+    const range = isProvider ? state.usageRange : userUsagePresets[state.userUsagePreset];
+    const query = new URLSearchParams({ group_by: groupBy, window_value: String(range.value), window_unit: range.unit });
+    if (!isProvider) query.set("bucket_minutes", String(range.bucketMinutes));
     if (selectorValue) query.set(filterName, selectorValue);
     const report = await api(`/admin/api/usage?${query}`);
     if (state.activeView !== (isProvider ? "platform_usage" : "user_usage")) return;
@@ -696,12 +711,12 @@ function usageToolbar(groupBy, selected) {
   const isProvider = groupBy === "provider";
   const options = isProvider ? state.config.providers : state.config.clients;
   return `<div class="usage-toolbar">
-    <div><h2>${isProvider ? "供应商消耗" : "访问密钥消耗"}</h2><p>平台价与实际口径使用同一个时间窗口，保证可以直接比较。</p></div>
+    <div><h2>${isProvider ? "供应商消耗" : "访问密钥消耗"}</h2><p>${isProvider ? "平台价与实际口径使用同一个时间窗口，保证可以直接比较。" : "按已确认结算的平台模拟价展示，不包含供应商实际成本。"}</p></div>
     <div class="usage-controls">
       <select id="usage-entity"><option value="">${isProvider ? "全部供应商" : "全部访问密钥"}</option>${options.map(item => `<option value="${escapeHTML(item.id)}" ${selected === item.id ? "selected" : ""}>${escapeHTML(isProvider ? item.display_name || item.id : item.id)}</option>`).join("")}</select>
-      <div class="quick-range"><button data-range="1-hours" class="${state.usageRange.value === 1 && state.usageRange.unit === "hours" ? "active" : ""}">1 小时</button><button data-range="1-days" class="${state.usageRange.value === 1 && state.usageRange.unit === "days" ? "active" : ""}">1 天</button><button data-range="7-days" class="${state.usageRange.value === 7 && state.usageRange.unit === "days" ? "active" : ""}">7 天</button></div>
+      ${isProvider ? `<div class="quick-range"><button data-range="1-hours" class="${state.usageRange.value === 1 && state.usageRange.unit === "hours" ? "active" : ""}">1 小时</button><button data-range="1-days" class="${state.usageRange.value === 1 && state.usageRange.unit === "days" ? "active" : ""}">1 天</button><button data-range="7-days" class="${state.usageRange.value === 7 && state.usageRange.unit === "days" ? "active" : ""}">7 天</button></div>
       <input id="usage-window-value" type="number" min="1" value="${state.usageRange.value}" aria-label="时间范围数值">
-      <select id="usage-window-unit"><option value="hours" ${state.usageRange.unit === "hours" ? "selected" : ""}>小时</option><option value="days" ${state.usageRange.unit === "days" ? "selected" : ""}>天</option></select>
+      <select id="usage-window-unit"><option value="hours" ${state.usageRange.unit === "hours" ? "selected" : ""}>小时</option><option value="days" ${state.usageRange.unit === "days" ? "selected" : ""}>天</option></select>` : `<div class="quick-range user-range">${Object.entries(userUsagePresets).map(([id, preset]) => `<button data-user-range="${id}" class="${state.userUsagePreset === id ? "active" : ""}">${preset.label}<small>${preset.bucketMinutes} 分钟</small></button>`).join("")}</div>`}
     </div>
   </div>`;
 }
@@ -715,6 +730,11 @@ function bindUsageControls(groupBy) {
   document.querySelectorAll("[data-range]").forEach(button => button.addEventListener("click", () => {
     const [value, unit] = button.dataset.range.split("-");
     state.usageRange = { value: Number(value), unit };
+    persistUIState();
+    renderUsage(groupBy);
+  }));
+  document.querySelectorAll("[data-user-range]").forEach(button => button.addEventListener("click", () => {
+    state.userUsagePreset = button.dataset.userRange;
     persistUIState();
     renderUsage(groupBy);
   }));
@@ -739,15 +759,80 @@ function usageReport(groupBy, report, selected) {
   const reportByID = new Map((report.groups || []).map(group => [group.id, group]));
   const groups = visible.map(item => reportByID.get(item.id) || { id: item.id, runs: 0, input_tokens: 0, output_tokens: 0, public_totals: [], actual_totals: [], models: [] });
   const rows = groups.flatMap(group => (group.models || []).map(model => ({ ...model, group_id: group.id })));
+  const detail = groupBy === "client" ? usageTrendCharts(report.public_series || []) : usageModelsTable(groupBy, rows);
   return `
     <div class="usage-summary-grid">${groups.map(group => usageSummaryCard(groupBy, group)).join("") || `<div class="empty-state">当前没有可统计对象</div>`}</div>
-    <div class="section-head"><div><h2>模型明细</h2><p>只列出所选时间范围内产生已确认结算的模型。</p></div><span class="range-label">${escapeHTML(formatRange(report.since, report.until))}</span></div>
-    ${usageModelsTable(groupBy, rows)}`;
+    <div class="section-head"><div><h2>${groupBy === "client" ? "模型消耗变化" : "模型明细"}</h2><p>${groupBy === "client" ? `每 ${report.bucket_minutes || "—"} 分钟一个结算时间点，只显示平台模拟价。` : "只列出所选时间范围内产生已确认结算的模型。"}</p></div><span class="range-label">${escapeHTML(formatRange(report.since, report.until))}</span></div>
+    ${detail}`;
 }
 
 function usageSummaryCard(groupBy, group) {
   const title = groupBy === "provider" ? providerName(group.id) : group.id;
-  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3 title="${escapeHTML(title)}">${escapeHTML(title)}</h3></div><strong title="${group.runs} 次请求">${group.runs}</strong></header><div class="usage-kpis"><div><span>平台消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div><div><span>实际消耗</span><b>${formatActual(group.actual_totals, groupBy === "client", groupBy === "provider" ? group.id : "")}</b></div></div><footer>${Number(group.input_tokens).toLocaleString()} 入 · ${Number(group.output_tokens).toLocaleString()} 出</footer></article>`;
+  const actual = groupBy === "provider" ? `<div><span>实际消耗</span><b>${formatActual(group.actual_totals, false, group.id)}</b></div>` : "";
+  return `<article class="usage-card"><header><div><span class="category">${groupBy === "provider" ? "PROVIDER" : "ACCESS KEY"}</span><h3 title="${escapeHTML(title)}">${escapeHTML(title)}</h3></div><strong title="${group.runs} 次请求">${group.runs}</strong></header><div class="usage-kpis ${groupBy === "client" ? "public-only" : ""}"><div><span>平台消耗</span><b>${formatUnitTotals(group.public_totals)}</b></div>${actual}</div><footer>${Number(group.input_tokens).toLocaleString()} 入 · ${Number(group.output_tokens).toLocaleString()} 出</footer></article>`;
+}
+
+const usageChartColors = ["#00a86b", "#2563eb", "#f97316", "#a855f7", "#06b6d4", "#f43f5e", "#65a30d", "#ec4899", "#ca8a04", "#4f46e5"];
+
+function usageTrendCharts(series) {
+  if (!series.length) return `<div class="empty-state">所选时间范围内没有平台价消耗</div>`;
+  const byUnit = new Map();
+  series.forEach(item => {
+    const unit = item.unit || "USD";
+    if (!byUnit.has(unit)) byUnit.set(unit, []);
+    byUnit.get(unit).push(item);
+  });
+  return `<div class="trend-list">${[...byUnit.entries()].map(([unit, items]) => usageTrendChart(unit, items)).join("")}</div>`;
+}
+
+function usageTrendChart(unit, series) {
+  const width = 1000, height = 330;
+  const margin = { left: 64, right: 20, top: 20, bottom: 44 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const count = Math.max(1, ...series.map(item => item.points?.length || 0));
+  const values = series.flatMap(item => (item.points || []).map(point => Number(point.total) || 0));
+  const maximum = niceChartMaximum(Math.max(0, ...values));
+  const x = index => margin.left + (count === 1 ? plotWidth / 2 : index * plotWidth / (count - 1));
+  const y = value => margin.top + plotHeight - Math.max(0, value) * plotHeight / maximum;
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const value = maximum * (4 - index) / 4;
+    const position = margin.top + index * plotHeight / 4;
+    return `<line x1="${margin.left}" y1="${position}" x2="${width - margin.right}" y2="${position}" class="chart-grid"/><text x="${margin.left - 10}" y="${position + 3}" text-anchor="end" class="chart-axis-label">${escapeHTML(chartValue(value))}</text>`;
+  }).join("");
+  const firstPoints = series[0].points || [];
+  const tickEvery = Math.max(1, Math.ceil(count / 7));
+  const xLabels = firstPoints.map((point, index) => index % tickEvery === 0 || index === count - 1 ? `<text x="${x(index)}" y="${height - 15}" text-anchor="middle" class="chart-axis-label">${escapeHTML(formatChartTime(point.start))}</text>` : "").join("");
+  const lines = series.map((item, seriesIndex) => {
+    const color = usageChartColors[seriesIndex % usageChartColors.length];
+    const points = (item.points || []).map((point, index) => ({ x: x(index), y: y(Number(point.total) || 0), value: point.total, start: point.start }));
+    const path = points.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
+    const dots = points.map(point => `<circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="2.4" fill="${color}"><title>${escapeHTML(item.deployment_id)} · ${escapeHTML(formatChartTime(point.start, true))} · ${escapeHTML(unit)} ${escapeHTML(fixedDecimal(point.value, 4))}</title></circle>`).join("");
+    return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
+  }).join("");
+  const legend = series.map((item, index) => `<span title="${escapeHTML(item.deployment_id)} · ${escapeHTML(unit)} ${escapeHTML(item.total)}"><svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4" fill="${usageChartColors[index % usageChartColors.length]}"></circle></svg><b>${escapeHTML(item.deployment_id)}</b><em>${escapeHTML(unit)} ${fixedDecimal(item.total, 2)}</em></span>`).join("");
+  return `<article class="trend-card"><header><div><span class="category">PLATFORM PRICE</span><h3>${escapeHTML(unit)}</h3></div><div class="trend-legend">${legend}</div></header><div class="trend-chart-scroll"><svg class="trend-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHTML(unit)} 平台价模型消耗变化">${grid}${xLabels}${lines}</svg></div></article>`;
+}
+
+function niceChartMaximum(value) {
+  if (!(value > 0)) return 1;
+  const power = 10 ** Math.floor(Math.log10(value));
+  const scaled = value / power;
+  const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+  return nice * power;
+}
+
+function chartValue(value) {
+  if (value >= 100) return value.toFixed(0);
+  if (value >= 1) return value.toFixed(2).replace(/\.?0+$/, "");
+  return value.toFixed(4).replace(/\.?0+$/, "") || "0";
+}
+
+function formatChartTime(value, detailed = false) {
+  const date = new Date(value);
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (!detailed && state.userUsagePreset !== "three_days") return time;
+  return `${date.getMonth() + 1}/${date.getDate()} ${time}`;
 }
 
 function usageModelsTable(groupBy, rows) {

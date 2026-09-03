@@ -24,6 +24,7 @@ import (
 const maxEventBytes = 8 << 20
 const acpDrainTimeout = 8 * time.Second
 const defaultWarmupTimeout = 30 * time.Second
+const workerInitializeTimeout = 30 * time.Second
 const workerReplenishRetry = 5 * time.Second
 
 const systemPrompt = "You are serving one text-only language model request. Never use tools, files, shell, network, MCP, plugins, GUI, subagents, or background tasks. Return only the answer requested by the user."
@@ -85,40 +86,13 @@ func New(config Config) (*Adapter, error) {
 		slot:   make(chan struct{}, config.MaxConcurrency),
 		ready:  make(chan struct{}),
 	}
-	// Initialize the common two-lane pool in parallel. When enabled, each lane
-	// performs one tiny real generation so Node startup, authentication, TLS and
-	// the upstream model route are warm before the public listener is ready.
-	type workerResult struct {
-		worker *acpWorker
-		err    error
-	}
-	results := make(chan workerResult, target)
-	for range target {
-		go func() {
-			worker, workerErr := prepareACPWorker(config)
-			results <- workerResult{worker: worker, err: workerErr}
-		}()
-	}
-	workers := make([]*acpWorker, 0, target)
-	var firstErr error
-	for range target {
-		result := <-results
-		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
-			}
-			continue
-		}
-		workers = append(workers, result.worker)
-	}
-	if firstErr != nil {
-		for _, worker := range workers {
-			worker.close()
-		}
-		return nil, firstErr
-	}
-	adapter.idle = workers
-	adapter.live = len(workers)
+	// Build and warm the common two-lane pool in the background. A desktop
+	// login can leave WorkBuddy's ACP initialization waiting on its own runtime;
+	// that must not prevent the API and admin listeners from starting. Public
+	// WorkBuddy requests still wait for a worker through acquireWorker.
+	adapter.mu.Lock()
+	adapter.scheduleReplenishLocked()
+	adapter.mu.Unlock()
 	return adapter, nil
 }
 
@@ -417,11 +391,22 @@ func newACPWorker(config Config) (*acpWorker, error) {
 		worker.close()
 		return nil, fmt.Errorf("initialize WorkBuddy ACP: %w", err)
 	}
-	if _, err := worker.waitRPCResult(initializeID); err != nil {
+	initializeResult := make(chan error, 1)
+	go func() {
+		_, waitErr := worker.waitRPCResult(initializeID)
+		initializeResult <- waitErr
+	}()
+	select {
+	case err := <-initializeResult:
+		if err == nil {
+			return worker, nil
+		}
 		worker.close()
 		return nil, fmt.Errorf("initialize WorkBuddy ACP: %w", err)
+	case <-time.After(workerInitializeTimeout):
+		worker.close()
+		return nil, errors.New("initialize WorkBuddy ACP timed out")
 	}
-	return worker, nil
 }
 
 func (w *acpWorker) run(ctx context.Context, request provider.Request, effort string, events chan<- provider.Event) bool {

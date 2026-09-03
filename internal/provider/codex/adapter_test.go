@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zhyuzh3d/llmserver/internal/provider"
+	"github.com/zhyuzh3d/llmserver/internal/toolcall"
 )
 
 func TestAdapterUsesMinimalDirectResponsesRequest(t *testing.T) {
@@ -72,6 +73,69 @@ exit 8
 	}
 	if text != "DIRECT_OK" || final == nil || final.Usage.InputTokens.Value != 12 || final.Usage.OutputTokens.Value != 3 {
 		t.Fatalf("text=%q final=%#v", text, final)
+	}
+}
+
+func TestAdapterUsesNativeDirectFunctionCalling(t *testing.T) {
+	executable := fakeCodex(t, `
+if [ "$1" = "--version" ]; then echo 'codex-cli test-1'; exit 0; fi
+exit 8
+`)
+	authPath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"tokens":{"access_token":"local-access","account_id":"local-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		tools, _ := body["tools"].([]any)
+		input, _ := body["input"].([]any)
+		include, _ := body["include"].([]any)
+		if len(tools) != 1 || len(input) != 1 || body["tool_choice"] != "required" || body["parallel_tool_calls"] != false {
+			t.Fatalf("unexpected function request: %#v", body)
+		}
+		if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+			t.Fatalf("stateless reasoning continuation was not requested: %#v", include)
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = response.Write([]byte("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":7}\"}}\n\n"))
+		_, _ = response.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"output\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":5}}}\n\n"))
+	}))
+	defer server.Close()
+	contract, err := toolcall.Parse(json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false},"strict":true}]`), json.RawMessage(`"required"`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := New(Config{
+		ProviderID: "codex", Executable: executable, ExpectedVersion: "codex-cli test-",
+		DirectEndpoint: server.URL, DirectClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(adapter.Retire)
+	events, err := adapter.Start(context.Background(), provider.Request{
+		UpstreamModel: "gpt-test", Instructions: "Use facts", Input: json.RawMessage(`[{"role":"user","content":[{"type":"input_text","text":"lookup 7"}]}]`), ToolCall: contract,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var final *provider.Final
+	for event := range events {
+		if event.Type == provider.EventFailed {
+			t.Fatal(event.Err)
+		}
+		if event.Type == provider.EventCompleted {
+			final = event.Final
+		}
+	}
+	if final == nil || final.Response == nil {
+		t.Fatalf("Codex function response was lost: %#v", final)
+	}
+	if err := contract.ValidateResponse(final.Response); err != nil {
+		t.Fatal(err)
 	}
 }
 
